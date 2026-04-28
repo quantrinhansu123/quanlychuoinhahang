@@ -18,3 +18,16 @@ View your app in AI Studio: https://ai.studio/apps/6021a5dd-6108-47e0-bafb-25ac4
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+
+## Supabase database (match current UI)
+
+Run this SQL in Supabase SQL Editor:
+
+- `supabase/migrations/20260427_create_checklist_schema.sql`
+- `supabase/migrations/20260428_add_dashboard_task_video_url.sql`
+
+This migration creates:
+
+- `dashboard_categories` and `dashboard_tasks` for the 3 dashboard columns.
+- `checklist_templates` for Operations > Checklist work (opening/closing).
+- `checklist_completions` and view `v_checklist_done` for Operations > Checklist DONE.
