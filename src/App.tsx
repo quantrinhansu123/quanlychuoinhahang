@@ -4,7 +4,7 @@
  */
 
 import { motion, AnimatePresence } from "motion/react";
-import React, { ReactNode, useEffect, useState } from "react";
+import React, { ReactNode, useEffect, useMemo, useState } from "react";
 import { 
   Leaf, 
   Cake, 
@@ -26,7 +26,9 @@ import {
   Settings2,
   Box,
   Users,
-  ClipboardList
+  ClipboardList,
+  CalendarRange,
+  Search
 } from "lucide-react";
 import { supabase } from "./lib/supabase";
 
@@ -110,6 +112,8 @@ interface MenuItem {
 
 interface Category {
   id: string;
+  /** Supabase dashboard_categories.id (UUID); omit for static fallback data */
+  dbCategoryId?: string;
   title: string;
   icon: ReactNode;
   color: "primary" | "secondary" | "tertiary";
@@ -171,6 +175,7 @@ const mapDashboardRowsToCategories = (
       const specialItems = orderedTasks.filter((task) => task.is_special);
       return {
         id: categoryRow.slug,
+        dbCategoryId: categoryRow.id,
         title: categoryRow.title,
         icon: getCategoryIcon(categoryRow.icon_name),
         color: categoryRow.color,
@@ -375,7 +380,7 @@ const CategoryColumn = ({
   };
 
   return (
-    <section className="flex flex-col h-full bg-white border-r border-gray-100 last:border-r-0">
+    <section className="flex flex-col h-full bg-white/88 backdrop-blur-[2px] border-r border-gray-100 last:border-r-0">
       <div className={`${headerColors[category.color]} text-white py-6 px-6 flex items-center justify-center gap-3 shadow-md sticky top-0 z-10`}>
         {category.icon}
         <h2 className="font-display uppercase tracking-widest text-2xl font-extrabold">{category.title}</h2>
@@ -546,11 +551,34 @@ const formatDateKeyToLabel = (dateKey: string) => {
   });
 };
 
+const formatDateKeyToWeekday = (dateKey: string) => {
+  const date = new Date(`${dateKey}T12:00:00`);
+  return date.toLocaleDateString("en-US", { weekday: "short" });
+};
+
+/** Inclusive list of YYYY-MM-DD keys from fromKey to toKey (valid ISO dates). */
+const enumerateDateKeysInRange = (fromKey: string, toKey: string): string[] => {
+  if (!fromKey || !toKey || fromKey > toKey) {
+    return [];
+  }
+  const keys: string[] = [];
+  const cur = new Date(`${fromKey}T12:00:00`);
+  const end = new Date(`${toKey}T12:00:00`);
+  while (cur <= end) {
+    keys.push(toDateKeyLocal(cur));
+    cur.setDate(cur.getDate() + 1);
+  }
+  return keys;
+};
+
 const DailyReportDashboard = () => {
   const [templateRows, setTemplateRows] = useState<ChecklistTemplateRow[]>([]);
   const [completionRows, setCompletionRows] = useState<ChecklistCompletionRow[]>([]);
-  const [fromDate, setFromDate] = useState("");
-  const [toDate, setToDate] = useState("");
+  const [fromDate, setFromDate] = useState(() => {
+    const now = new Date();
+    return toDateKeyLocal(new Date(now.getFullYear(), now.getMonth(), 1));
+  });
+  const [toDate, setToDate] = useState(() => toDateKeyLocal(new Date()));
   const [selectedDateKey, setSelectedDateKey] = useState<string | null>(null);
 
   useEffect(() => {
@@ -585,35 +613,28 @@ const DailyReportDashboard = () => {
     };
   }, []);
 
-  const filteredCompletions = completionRows.filter((row) => {
-    const completedDateKey = toDateKeyLocal(new Date(row.completed_at));
-    if (fromDate && completedDateKey < fromDate) {
-      return false;
+  const completionsByDate = useMemo(() => {
+    const map = new Map<string, ChecklistCompletionRow[]>();
+    for (const row of completionRows) {
+      const dateKey = toDateKeyLocal(new Date(row.completed_at));
+      const list = map.get(dateKey) ?? [];
+      list.push(row);
+      map.set(dateKey, list);
     }
-    if (toDate && completedDateKey > toDate) {
-      return false;
-    }
-    return true;
-  });
+    return map;
+  }, [completionRows]);
 
-  const completionsByDate = new Map<string, ChecklistCompletionRow[]>();
-  for (const row of filteredCompletions) {
-    const dateKey = toDateKeyLocal(new Date(row.completed_at));
-    const currentRows = completionsByDate.get(dateKey) ?? [];
-    currentRows.push(row);
-    completionsByDate.set(dateKey, currentRows);
-  }
+  const dateCards = useMemo(() => {
+    const keysInRange = enumerateDateKeysInRange(fromDate, toDate).sort((a, b) => b.localeCompare(a));
+    const totalOpening = templateRows.filter((row) => row.shift === "opening").length;
+    const totalClosing = templateRows.filter((row) => row.shift === "closing").length;
 
-  const dateCards = Array.from(completionsByDate.keys())
-    .sort((a, b) => b.localeCompare(a))
-    .map((dateKey) => {
+    return keysInRange.map((dateKey) => {
       const rows = completionsByDate.get(dateKey) ?? [];
       const doneLabelsByShift = {
         opening: new Set(rows.filter((row) => row.shift === "opening").map((row) => row.task_label)),
         closing: new Set(rows.filter((row) => row.shift === "closing").map((row) => row.task_label)),
       };
-      const totalOpening = templateRows.filter((row) => row.shift === "opening").length;
-      const totalClosing = templateRows.filter((row) => row.shift === "closing").length;
       const doneOpening = doneLabelsByShift.opening.size;
       const doneClosing = doneLabelsByShift.closing.size;
       const totalTasks = totalOpening + totalClosing;
@@ -624,6 +645,7 @@ const DailyReportDashboard = () => {
       return {
         dateKey,
         label: formatDateKeyToLabel(dateKey),
+        weekday: formatDateKeyToWeekday(dateKey),
         doneOpening,
         totalOpening,
         doneClosing,
@@ -635,14 +657,15 @@ const DailyReportDashboard = () => {
         closingPercent,
       };
     });
+  }, [fromDate, toDate, completionsByDate, templateRows]);
 
   useEffect(() => {
-    if (!selectedDateKey && dateCards.length > 0) {
-      setSelectedDateKey(dateCards[0].dateKey);
+    if (dateCards.length === 0) {
+      setSelectedDateKey(null);
       return;
     }
-    if (selectedDateKey && !dateCards.some((card) => card.dateKey === selectedDateKey)) {
-      setSelectedDateKey(dateCards[0]?.dateKey ?? null);
+    if (!selectedDateKey || !dateCards.some((card) => card.dateKey === selectedDateKey)) {
+      setSelectedDateKey(dateCards[0].dateKey);
     }
   }, [dateCards, selectedDateKey]);
 
@@ -657,125 +680,252 @@ const DailyReportDashboard = () => {
   const openingPending = openingTemplates.filter((label) => !doneByShift.opening.has(label));
   const closingPending = closingTemplates.filter((label) => !doneByShift.closing.has(label));
 
-  return (
-    <main className="flex-1 overflow-y-auto p-4 md:p-8 bg-white scrollbar-hide">
-      <div className="w-full space-y-6">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div>
-            <h1 className="text-3xl font-display font-bold text-on-background mb-2">Dashboard</h1>
-            <p className="text-gray-500 font-medium">Daily work progress report.</p>
-          </div>
-          <div className="flex flex-col sm:flex-row gap-3">
-            <label className="text-sm font-semibold text-gray-600 flex items-center gap-2">
-              From date
-              <input
-                type="date"
-                value={fromDate}
-                onChange={(event) => setFromDate(event.target.value)}
-                className="border border-gray-200 rounded-lg px-3 py-2"
-              />
-            </label>
-            <label className="text-sm font-semibold text-gray-600 flex items-center gap-2">
-              To date
-              <input
-                type="date"
-                value={toDate}
-                onChange={(event) => setToDate(event.target.value)}
-                className="border border-gray-200 rounded-lg px-3 py-2"
-              />
-            </label>
-          </div>
-        </div>
+  const rangeInvalid = Boolean(fromDate && toDate && fromDate > toDate);
+  const rangeIncomplete = !fromDate || !toDate;
+  const setPresetLastDays = (days: number) => {
+    const end = new Date();
+    const start = new Date();
+    start.setDate(start.getDate() - (days - 1));
+    setFromDate(toDateKeyLocal(start));
+    setToDate(toDateKeyLocal(end));
+  };
+  const setPresetThisMonth = () => {
+    const now = new Date();
+    setFromDate(toDateKeyLocal(new Date(now.getFullYear(), now.getMonth(), 1)));
+    setToDate(toDateKeyLocal(now));
+  };
 
-        <section className="rounded-2xl border border-primary-main/20 bg-primary-main/5 p-5 space-y-4">
-          <h2 className="text-xl font-bold text-primary-main">Daily cards (% completed)</h2>
-          {dateCards.length === 0 ? (
-            <p className="text-gray-500">No data found for the selected date range.</p>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-              {dateCards.map((card) => (
+  return (
+    <main className="flex-1 overflow-y-auto p-4 md:p-8 bg-transparent scrollbar-hide">
+      <div className="w-full max-w-6xl mx-auto space-y-8">
+        <header className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm shadow-slate-200/50">
+          <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400 mb-1">Reports</p>
+              <h1 className="text-3xl font-display font-bold text-slate-900 tracking-tight">Dashboard</h1>
+              <p className="mt-1 text-slate-600 text-sm max-w-lg">
+                Completion by day for the selected range. Each card is one calendar day; percentages compare
+                checklist completions to active templates.
+              </p>
+            </div>
+            <div className="w-full lg:w-auto space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-semibold text-slate-500 mr-1">Quick range</span>
                 <button
-                  key={card.dateKey}
                   type="button"
-                  onClick={() => setSelectedDateKey(card.dateKey)}
-                  className={`text-left rounded-xl border p-4 transition-all ${
-                    selectedDateKey === card.dateKey
-                      ? "border-primary-main bg-white shadow-sm"
-                      : "border-gray-200 bg-white hover:border-primary-main/40"
-                  }`}
+                  onClick={() => setPresetLastDays(7)}
+                  className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-bold text-slate-700 hover:bg-slate-100 transition-colors"
                 >
-                  <p className="text-sm font-bold text-gray-800">{card.label}</p>
-                  <p className="mt-1 text-sm font-semibold text-gray-600">
-                    Completed {card.totalDone}/{card.totalTasks} tasks
-                  </p>
-                  <div className="mt-2 grid grid-cols-2 gap-2">
-                    <div className="rounded-lg bg-green-50 border border-green-200 px-2 py-2">
-                      <p className="text-[11px] font-bold text-green-700 uppercase">Opening</p>
-                      <p className="text-lg font-extrabold text-green-800">{card.openingPercent}%</p>
-                    </div>
-                    <div className="rounded-lg bg-orange-50 border border-orange-200 px-2 py-2">
-                      <p className="text-[11px] font-bold text-orange-700 uppercase">Closing</p>
-                      <p className="text-lg font-extrabold text-orange-800">{card.closingPercent}%</p>
-                    </div>
-                  </div>
+                  Last 7 days
                 </button>
-              ))}
+                <button
+                  type="button"
+                  onClick={() => setPresetThisMonth()}
+                  className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-bold text-slate-700 hover:bg-slate-100 transition-colors"
+                >
+                  This month
+                </button>
+              </div>
+              <div className="flex flex-col sm:flex-row sm:items-end gap-3 rounded-xl border border-slate-200 bg-slate-50/80 p-4">
+                <label className="flex flex-col gap-1.5 text-sm font-semibold text-slate-700 min-w-[140px]">
+                  From
+                  <input
+                    type="date"
+                    value={fromDate}
+                    onChange={(event) => setFromDate(event.target.value)}
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                  />
+                </label>
+                <label className="flex flex-col gap-1.5 text-sm font-semibold text-slate-700 min-w-[140px]">
+                  To
+                  <input
+                    type="date"
+                    value={toDate}
+                    onChange={(event) => setToDate(event.target.value)}
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                  />
+                </label>
+                <div className="hidden sm:flex items-center justify-center pb-2 text-slate-300">
+                  <CalendarRange className="w-5 h-5" aria-hidden />
+                </div>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <section className="space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <h2 className="text-lg font-bold text-slate-900">Daily cards</h2>
+            <span className="text-xs font-semibold text-slate-500 tabular-nums">
+              {rangeIncomplete
+                ? "Set both dates"
+                : rangeInvalid
+                  ? "Invalid range"
+                  : `${dateCards.length} day${dateCards.length === 1 ? "" : "s"} in range`}
+            </span>
+          </div>
+          {rangeIncomplete ? (
+            <div className="rounded-2xl border border-slate-200 bg-white px-5 py-8 text-center text-slate-600 text-sm">
+              Select both <strong className="text-slate-800">From</strong> and <strong className="text-slate-800">To</strong>{" "}
+              to show one card per day in that range.
+            </div>
+          ) : rangeInvalid ? (
+            <div className="rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm font-medium text-amber-900">
+              &quot;From&quot; must be on or before &quot;To&quot;. Adjust the dates to see cards.
+            </div>
+          ) : dateCards.length === 0 ? (
+            <div className="rounded-2xl border border-slate-200 bg-white px-5 py-8 text-center text-slate-500 text-sm">
+              No days in this range.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              {dateCards.map((card) => {
+                const isActive = selectedDateKey === card.dateKey;
+                return (
+                  <button
+                    key={card.dateKey}
+                    type="button"
+                    onClick={() => setSelectedDateKey(card.dateKey)}
+                    className={`group text-left rounded-2xl border p-5 transition-all duration-200 ${
+                      isActive
+                        ? "border-primary-main bg-white ring-2 ring-primary-main/30 shadow-md shadow-slate-200/60"
+                        : "border-slate-200/90 bg-white hover:border-slate-300 hover:shadow-md shadow-sm"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-xs font-bold uppercase tracking-wider text-slate-400">{card.weekday}</p>
+                        <p className="text-lg font-bold text-slate-900 mt-0.5">{card.label}</p>
+                      </div>
+                      <div
+                        className={`rounded-full px-3 py-1 text-xs font-extrabold tabular-nums ${
+                          card.completionPercent >= 80
+                            ? "bg-emerald-100 text-emerald-800"
+                            : card.completionPercent >= 40
+                              ? "bg-amber-100 text-amber-900"
+                              : "bg-slate-100 text-slate-700"
+                        }`}
+                      >
+                        {card.completionPercent}% total
+                      </div>
+                    </div>
+                    <p className="mt-3 text-sm text-slate-600">
+                      <span className="font-semibold text-slate-800">{card.totalDone}</span>
+                      <span className="text-slate-400"> / </span>
+                      {card.totalTasks} tasks completed
+                    </p>
+                    <div className="mt-4 grid grid-cols-2 gap-3">
+                      <div className="rounded-xl bg-emerald-50/90 border border-emerald-100 px-3 py-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-[10px] font-bold uppercase tracking-wide text-emerald-800/90">Opening</p>
+                          <p className="text-base font-extrabold text-emerald-900 tabular-nums">{card.openingPercent}%</p>
+                        </div>
+                        <div className="mt-2 h-1.5 rounded-full bg-emerald-200/80 overflow-hidden">
+                          <div
+                            className="h-full rounded-full bg-emerald-600 transition-all duration-300"
+                            style={{ width: `${card.openingPercent}%` }}
+                          />
+                        </div>
+                      </div>
+                      <div className="rounded-xl bg-orange-50/90 border border-orange-100 px-3 py-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-[10px] font-bold uppercase tracking-wide text-orange-900/90">Closing</p>
+                          <p className="text-base font-extrabold text-orange-950 tabular-nums">{card.closingPercent}%</p>
+                        </div>
+                        <div className="mt-2 h-1.5 rounded-full bg-orange-200/80 overflow-hidden">
+                          <div
+                            className="h-full rounded-full bg-orange-600 transition-all duration-300"
+                            style={{ width: `${card.closingPercent}%` }}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           )}
         </section>
 
-        <section className="rounded-2xl border border-gray-200 bg-white p-5 space-y-5">
-          <h2 className="text-xl font-bold text-gray-900">
-            Details {selectedCard ? `for ${selectedCard.label}` : ""}
-          </h2>
+        <section className="rounded-2xl border border-slate-200/90 bg-white p-6 shadow-sm shadow-slate-200/40 space-y-6">
+          <div className="border-b border-slate-100 pb-4">
+            <h2 className="text-lg font-bold text-slate-900">Day detail</h2>
+            {selectedCard ? (
+              <p className="text-sm text-slate-500 mt-1">
+                {selectedCard.weekday} · {selectedCard.label}
+              </p>
+            ) : (
+              <p className="text-sm text-slate-500 mt-1">Select a day card above.</p>
+            )}
+          </div>
           {selectedCard ? (
             <>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="rounded-xl border border-green-200 bg-green-50 p-4">
-                  <p className="text-sm font-bold text-green-700">Opening team</p>
-                  <p className="text-lg font-extrabold text-green-800">
-                    Completed {selectedCard.doneOpening} / {selectedCard.totalOpening}
+                <div className="rounded-xl border border-emerald-100 bg-gradient-to-br from-emerald-50 to-white p-5">
+                  <p className="text-xs font-bold uppercase tracking-wide text-emerald-700">Opening team</p>
+                  <p className="mt-2 text-2xl font-extrabold text-emerald-950 tabular-nums">
+                    {selectedCard.doneOpening}
+                    <span className="text-lg font-bold text-emerald-700/80"> / {selectedCard.totalOpening}</span>
                   </p>
-                  <p className="text-sm text-green-700">
-                    Pending {selectedCard.totalOpening - selectedCard.doneOpening}
+                  <p className="mt-1 text-sm font-medium text-emerald-800/90">
+                    {selectedCard.totalOpening - selectedCard.doneOpening} pending
                   </p>
                 </div>
-                <div className="rounded-xl border border-orange-200 bg-orange-50 p-4">
-                  <p className="text-sm font-bold text-orange-700">Closing team</p>
-                  <p className="text-lg font-extrabold text-orange-800">
-                    Completed {selectedCard.doneClosing} / {selectedCard.totalClosing}
+                <div className="rounded-xl border border-orange-100 bg-gradient-to-br from-orange-50 to-white p-5">
+                  <p className="text-xs font-bold uppercase tracking-wide text-orange-900">Closing team</p>
+                  <p className="mt-2 text-2xl font-extrabold text-orange-950 tabular-nums">
+                    {selectedCard.doneClosing}
+                    <span className="text-lg font-bold text-orange-800/80"> / {selectedCard.totalClosing}</span>
                   </p>
-                  <p className="text-sm text-orange-700">
-                    Pending {selectedCard.totalClosing - selectedCard.doneClosing}
+                  <p className="mt-1 text-sm font-medium text-orange-900/90">
+                    {selectedCard.totalClosing - selectedCard.doneClosing} pending
                   </p>
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-                <div className="rounded-xl border border-gray-200 p-4">
-                  <p className="font-bold text-gray-800 mb-2">Opening - Pending tasks</p>
-                  <ul className="space-y-1 text-sm text-gray-600 max-h-64 overflow-y-auto">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                <div className="rounded-xl border border-slate-200 bg-slate-50/50 p-5">
+                  <p className="text-sm font-bold text-slate-800 mb-3">Opening — pending</p>
+                  <ul className="space-y-2 text-sm text-slate-600 max-h-64 overflow-y-auto pr-1">
                     {openingPending.length > 0 ? (
-                      openingPending.map((item) => <li key={item}>- {item}</li>)
+                      openingPending.map((item) => (
+                        <li
+                          key={item}
+                          className="flex gap-2 rounded-lg bg-white border border-slate-100 px-3 py-2 text-slate-700"
+                        >
+                          <span className="text-slate-400 shrink-0">·</span>
+                          <span>{item}</span>
+                        </li>
+                      ))
                     ) : (
-                      <li>- All tasks completed</li>
+                      <li className="text-slate-500 italic py-2">All opening tasks completed.</li>
                     )}
                   </ul>
                 </div>
-                <div className="rounded-xl border border-gray-200 p-4">
-                  <p className="font-bold text-gray-800 mb-2">Closing - Pending tasks</p>
-                  <ul className="space-y-1 text-sm text-gray-600 max-h-64 overflow-y-auto">
+                <div className="rounded-xl border border-slate-200 bg-slate-50/50 p-5">
+                  <p className="text-sm font-bold text-slate-800 mb-3">Closing — pending</p>
+                  <ul className="space-y-2 text-sm text-slate-600 max-h-64 overflow-y-auto pr-1">
                     {closingPending.length > 0 ? (
-                      closingPending.map((item) => <li key={item}>- {item}</li>)
+                      closingPending.map((item) => (
+                        <li
+                          key={item}
+                          className="flex gap-2 rounded-lg bg-white border border-slate-100 px-3 py-2 text-slate-700"
+                        >
+                          <span className="text-slate-400 shrink-0">·</span>
+                          <span>{item}</span>
+                        </li>
+                      ))
                     ) : (
-                      <li>- All tasks completed</li>
+                      <li className="text-slate-500 italic py-2">All closing tasks completed.</li>
                     )}
                   </ul>
                 </div>
               </div>
             </>
           ) : (
-            <p className="text-gray-500">Select a day card to view details.</p>
+            !rangeInvalid && (
+              <p className="text-sm text-slate-500">Select a day card to view pending tasks and counts.</p>
+            )
           )}
         </section>
       </div>
@@ -840,7 +990,22 @@ const OperationsDashboard = () => {
   const [doneLabel, setDoneLabel] = useState("");
   const [doneDate, setDoneDate] = useState("");
   const [doneTime, setDoneTime] = useState("");
+  const [operationsSearch, setOperationsSearch] = useState("");
   const todayDoneDateLabel = getTodayDoneDateLabel();
+
+  const operationsSearchNorm = operationsSearch.trim().toLowerCase();
+  const taskLabelMatchesSearch = (label: string) =>
+    !operationsSearchNorm || label.toLowerCase().includes(operationsSearchNorm);
+  const doneTaskMatchesSearch = (task: DoneTask) => {
+    if (!operationsSearchNorm) {
+      return true;
+    }
+    return (
+      task.label.toLowerCase().includes(operationsSearchNorm) ||
+      task.date.toLowerCase().includes(operationsSearchNorm) ||
+      task.time.toLowerCase().includes(operationsSearchNorm)
+    );
+  };
 
   const completedClosingLabelsToday = new Set(
     closingDoneTasks.filter((task) => task.date === todayDoneDateLabel).map((task) => task.label)
@@ -859,6 +1024,15 @@ const OperationsDashboard = () => {
   const totalOpeningWorkCount = openingWorkTasks.length;
   const doneClosingTodayCount = totalClosingWorkCount - visibleClosingWorkTasks.length;
   const doneOpeningTodayCount = totalOpeningWorkCount - visibleOpeningWorkTasks.length;
+
+  const filteredClosingWorkTasks = visibleClosingWorkTasks.filter((task) =>
+    taskLabelMatchesSearch(task.label)
+  );
+  const filteredOpeningWorkTasks = visibleOpeningWorkTasks.filter((task) =>
+    taskLabelMatchesSearch(task.label)
+  );
+  const filteredClosingDoneTasks = closingDoneTasks.filter(doneTaskMatchesSearch);
+  const filteredOpeningDoneTasks = openingDoneTasks.filter(doneTaskMatchesSearch);
 
   useEffect(() => {
     let mounted = true;
@@ -1023,13 +1197,35 @@ const OperationsDashboard = () => {
   };
 
   return (
-    <main className="flex-1 overflow-y-auto p-4 md:p-8 bg-white scrollbar-hide">
+    <main className="flex-1 overflow-y-auto p-4 md:p-8 bg-transparent scrollbar-hide">
       <div className="w-full">
-        <div className="flex flex-col md:flex-row md:items-center justify-between mb-8 gap-4">
+        <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 gap-4">
           <div>
             <h1 className="text-3xl font-display font-bold text-on-background mb-2">Checklist Management</h1>
             <p className="text-gray-500 font-medium">Manage daily operational task lists for kitchen staff.</p>
           </div>
+        </div>
+
+        <div className="mb-8 max-w-2xl">
+          <label className="relative block">
+            <span className="sr-only">Search tasks</span>
+            <Search
+              className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-gray-400"
+              aria-hidden
+            />
+            <input
+              type="search"
+              value={operationsSearch}
+              onChange={(e) => setOperationsSearch(e.target.value)}
+              placeholder="Search by task name, date, or time…"
+              className="w-full rounded-xl border border-gray-200 bg-white py-3 pl-11 pr-4 text-sm font-medium text-gray-900 shadow-sm placeholder:text-gray-400 focus:border-secondary-main/40 focus:outline-none focus:ring-2 focus:ring-secondary-main/20"
+            />
+          </label>
+          {operationsSearchNorm ? (
+            <p className="mt-2 text-xs font-semibold text-gray-500">
+              Showing matches in Checklist work and Checklist DONE
+            </p>
+          ) : null}
         </div>
 
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-8">
@@ -1052,11 +1248,18 @@ const OperationsDashboard = () => {
                 <div className="flex items-center gap-2">
                   <h3 className="text-sm font-extrabold text-gray-700 uppercase tracking-[0.2em]">Closing team</h3>
                   <span className="inline-flex min-w-6 h-6 items-center justify-center rounded-full bg-red-500 px-2 text-xs font-extrabold text-white">
-                    {visibleClosingWorkTasks.length}
+                    {filteredClosingWorkTasks.length}
                   </span>
                 </div>
                 <div className="space-y-3">
-                  {visibleClosingWorkTasks.map((task) => (
+                  {filteredClosingWorkTasks.length === 0 ? (
+                    <p className="text-sm text-gray-500 py-4 px-1">
+                      {visibleClosingWorkTasks.length === 0
+                        ? "No remaining closing tasks today."
+                        : "No closing tasks match your search."}
+                    </p>
+                  ) : null}
+                  {filteredClosingWorkTasks.map((task) => (
                     <motion.div
                       key={task.id}
                       whileHover={{ x: 4 }}
@@ -1080,11 +1283,18 @@ const OperationsDashboard = () => {
                 <div className="flex items-center gap-2">
                   <h3 className="text-sm font-extrabold text-gray-700 uppercase tracking-[0.2em]">Opening team</h3>
                   <span className="inline-flex min-w-6 h-6 items-center justify-center rounded-full bg-red-500 px-2 text-xs font-extrabold text-white">
-                    {visibleOpeningWorkTasks.length}
+                    {filteredOpeningWorkTasks.length}
                   </span>
                 </div>
                 <div className="space-y-3">
-                  {visibleOpeningWorkTasks.map((task) => (
+                  {filteredOpeningWorkTasks.length === 0 ? (
+                    <p className="text-sm text-gray-500 py-4 px-1">
+                      {visibleOpeningWorkTasks.length === 0
+                        ? "No remaining opening tasks today."
+                        : "No opening tasks match your search."}
+                    </p>
+                  ) : null}
+                  {filteredOpeningWorkTasks.map((task) => (
                     <motion.div
                       key={task.id}
                       whileHover={{ x: 4 }}
@@ -1128,7 +1338,14 @@ const OperationsDashboard = () => {
                   </span>
                 </div>
                 <div className="space-y-2">
-                  {closingDoneTasks.map((task) => (
+                  {filteredClosingDoneTasks.length === 0 ? (
+                    <p className="text-sm text-gray-500 py-3 px-4">
+                      {closingDoneTasks.length === 0
+                        ? "No closing completions yet."
+                        : "No closing completions match your search."}
+                    </p>
+                  ) : null}
+                  {filteredClosingDoneTasks.map((task) => (
                     <motion.div key={task.id} className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center p-4 bg-gray-50 rounded-xl group border border-transparent hover:border-gray-200 transition-all">
                       <div className="col-span-1 md:col-span-6 flex items-center gap-3">
                         <CheckCircle2 className="w-5 h-5 text-primary-main fill-primary-main/10" />
@@ -1159,7 +1376,14 @@ const OperationsDashboard = () => {
                   </span>
                 </div>
                 <div className="space-y-2">
-                  {openingDoneTasks.map((task) => (
+                  {filteredOpeningDoneTasks.length === 0 ? (
+                    <p className="text-sm text-gray-500 py-3 px-4">
+                      {openingDoneTasks.length === 0
+                        ? "No opening completions yet."
+                        : "No opening completions match your search."}
+                    </p>
+                  ) : null}
+                  {filteredOpeningDoneTasks.map((task) => (
                     <motion.div key={task.id} className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center p-4 bg-gray-50 rounded-xl group border border-transparent hover:border-gray-200 transition-all">
                       <div className="col-span-1 md:col-span-6 flex items-center gap-3">
                         <CheckCircle2 className="w-5 h-5 text-primary-main fill-primary-main/10" />
@@ -1320,100 +1544,295 @@ const OperationsDashboard = () => {
   );
 };
 
+interface BranchSettingRow {
+  id: string;
+  branch_name: string;
+  logo_url: string;
+  video_url: string;
+  notes: string | null;
+  sort_order: number;
+}
+
 const TableSettings = () => {
-  const [imageNameLink, setImageNameLink] = useState(BRAND_LOGO_URL);
-  const [videoLink, setVideoLink] = useState("");
-  const [savedAt, setSavedAt] = useState<string | null>(null);
+  const [branches, setBranches] = useState<BranchSettingRow[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [rowMessage, setRowMessage] = useState<{ id: string; text: string; ok: boolean } | null>(null);
+
+  const loadBranches = async () => {
+    setLoadError(null);
+    const { data, error } = await supabase
+      .from("branch_settings")
+      .select("id,branch_name,logo_url,video_url,notes,sort_order")
+      .order("sort_order", { ascending: true });
+
+    if (error) {
+      setLoadError("Could not load branches. Run migration 20260502_branch_settings.sql in Supabase.");
+      setBranches([]);
+      return;
+    }
+    setBranches((data ?? []) as BranchSettingRow[]);
+  };
+
+  useEffect(() => {
+    void loadBranches();
+  }, []);
+
+  const updateBranchField = (id: string, field: keyof BranchSettingRow, value: string) => {
+    setBranches((prev) =>
+      prev.map((row) => (row.id === id ? { ...row, [field]: value } : row))
+    );
+    setRowMessage(null);
+  };
+
+  const handleBranchLogoFile = async (id: string, event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file?.type.startsWith("image/")) {
+      setRowMessage({ id, text: "Please choose an image file.", ok: false });
+      return;
+    }
+    try {
+      const base64 = await convertFileToBase64(file);
+      updateBranchField(id, "logo_url", base64);
+      setRowMessage({ id, text: "Logo loaded — click Save row to persist.", ok: true });
+    } catch {
+      setRowMessage({ id, text: "Could not read image.", ok: false });
+    }
+  };
+
+  const saveBranchRow = async (row: BranchSettingRow) => {
+    setRowMessage(null);
+    const name = row.branch_name.trim();
+    if (!name) {
+      setRowMessage({ id: row.id, text: "Branch name is required.", ok: false });
+      return;
+    }
+    const { error } = await supabase
+      .from("branch_settings")
+      .update({
+        branch_name: name,
+        logo_url: row.logo_url.trim(),
+        video_url: row.video_url.trim(),
+        notes: row.notes?.trim() || null,
+        sort_order: row.sort_order,
+      })
+      .eq("id", row.id);
+
+    if (error) {
+      setRowMessage({
+        id: row.id,
+        text: error.message.includes("duplicate") || error.code === "23505"
+          ? "Another branch already uses this name."
+          : "Save failed. Check Supabase policies and try again.",
+        ok: false,
+      });
+      return;
+    }
+    setRowMessage({ id: row.id, text: "Saved.", ok: true });
+    await loadBranches();
+  };
+
+  const addBranch = async () => {
+    setRowMessage(null);
+    const nextOrder =
+      branches.length > 0 ? Math.max(...branches.map((b) => b.sort_order)) + 1 : 0;
+    const baseName = "New branch";
+    let candidate = `${baseName} ${nextOrder + 1}`;
+    let n = nextOrder + 1;
+    while (branches.some((b) => b.branch_name === candidate)) {
+      n += 1;
+      candidate = `${baseName} ${n}`;
+    }
+
+    const { data, error } = await supabase
+      .from("branch_settings")
+      .insert({
+        branch_name: candidate,
+        logo_url: "",
+        video_url: "",
+        notes: "",
+        sort_order: nextOrder,
+      })
+      .select("id,branch_name,logo_url,video_url,notes,sort_order")
+      .single();
+
+    if (error || !data) {
+      setLoadError("Could not add branch. Check migration and insert policy.");
+      return;
+    }
+    setBranches((prev) => [...prev, data as BranchSettingRow]);
+    setRowMessage({ id: (data as BranchSettingRow).id, text: "New row added — edit and Save row.", ok: true });
+  };
+
+  const deleteBranchRow = async (row: BranchSettingRow) => {
+    if (!window.confirm(`Delete branch "${row.branch_name}"? This cannot be undone.`)) {
+      return;
+    }
+    setRowMessage(null);
+    const { error } = await supabase.from("branch_settings").delete().eq("id", row.id);
+    if (error) {
+      setRowMessage({ id: row.id, text: "Delete failed.", ok: false });
+      return;
+    }
+    setBranches((prev) => prev.filter((b) => b.id !== row.id));
+  };
 
   return (
-    <main className="flex-1 overflow-y-auto p-4 md:p-8 bg-white scrollbar-hide">
-      <div className="max-w-5xl mx-auto space-y-6">
-        <div>
-          <h1 className="text-3xl font-display font-bold text-on-background mb-2">Settings</h1>
-          <p className="text-gray-500 font-medium">
-            Cai dat ten anh (dang link) va link video cho bang.
-          </p>
+    <main className="flex-1 overflow-y-auto p-4 md:p-8 bg-transparent scrollbar-hide">
+      <div className="max-w-6xl mx-auto space-y-6">
+        <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
+          <div>
+            <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400 mb-1">Configuration</p>
+            <h1 className="text-3xl font-display font-bold text-slate-900 mb-2">Settings</h1>
+            <p className="text-slate-600 text-sm max-w-2xl">
+              Configure logo, video, and notes <strong className="text-slate-800">per branch</strong> (column{" "}
+              <strong className="text-slate-800">Branch</strong>). Each row is one location or franchise.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => void addBranch()}
+            className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary-main px-5 py-2.5 text-sm font-bold text-white shadow-sm hover:bg-primary-main/90 transition-all"
+          >
+            <Plus className="w-4 h-4" />
+            Add branch
+          </button>
         </div>
 
-        <section className="bg-white border border-gray-100 rounded-2xl shadow-sm p-6 space-y-6">
-          <h2 className="text-xl font-bold text-gray-900">Bang Setting</h2>
-
-          <div className="space-y-4">
-            <label className="space-y-2 block">
-              <span className="text-sm font-bold text-gray-700">Ten anh (link anh)</span>
-              <input
-                type="url"
-                placeholder="https://example.com/logo.jpg"
-                value={imageNameLink}
-                onChange={(e) => setImageNameLink(e.target.value)}
-                className="w-full border border-gray-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-primary-main/30"
-              />
-            </label>
-
-            <label className="space-y-2 block">
-              <span className="text-sm font-bold text-gray-700">Link video</span>
-              <input
-                type="url"
-                placeholder="https://example.com/video.mp4"
-                value={videoLink}
-                onChange={(e) => setVideoLink(e.target.value)}
-                className="w-full border border-gray-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-primary-main/30"
-              />
-            </label>
+        {loadError && (
+          <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-800">
+            {loadError}
           </div>
+        )}
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
-            <div className="rounded-xl border border-gray-100 p-3">
-              <p className="text-xs font-bold uppercase tracking-wider text-gray-400 mb-2">Preview image</p>
-              {imageNameLink ? (
-                <img
-                  src={imageNameLink}
-                  alt="Preview"
-                  className="w-full h-40 object-cover rounded-lg bg-gray-50"
-                />
-              ) : (
-                <div className="w-full h-40 rounded-lg bg-gray-50 flex items-center justify-center text-gray-400 text-sm">
-                  Chua co link anh
-                </div>
-              )}
-            </div>
-
-            <div className="rounded-xl border border-gray-100 p-3">
-              <p className="text-xs font-bold uppercase tracking-wider text-gray-400 mb-2">Preview video</p>
-              {videoLink ? (
-                isIframeVideoSource(videoLink) ? (
-                  <iframe
-                    src={getEmbeddableVideoUrl(videoLink)}
-                    title="Google Drive video preview"
-                    allow="autoplay; encrypted-media; picture-in-picture"
-                    allowFullScreen
-                    className="w-full h-40 rounded-lg bg-gray-50"
-                  />
+        <section className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="border-b border-slate-200 bg-slate-50/90">
+                  <th className="px-4 py-3 font-bold text-slate-700 whitespace-nowrap">Branch</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 min-w-[200px]">Logo URL / Base64</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 min-w-[200px]">Video URL</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 min-w-[180px]">Notes</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 whitespace-nowrap">Preview</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 text-right whitespace-nowrap">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {branches.length === 0 && !loadError ? (
+                  <tr>
+                    <td colSpan={6} className="px-4 py-10 text-center text-slate-500">
+                      No branches yet. Click &quot;Add branch&quot; or run the database migration.
+                    </td>
+                  </tr>
                 ) : (
-                  <video
-                    src={videoLink}
-                    controls
-                    className="w-full h-40 rounded-lg bg-gray-50"
-                  />
-                )
-              ) : (
-                <div className="w-full h-40 rounded-lg bg-gray-50 flex items-center justify-center text-gray-400 text-sm">
-                  Chua co link video
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div className="pt-2 flex items-center gap-3">
-            <button
-              onClick={() => setSavedAt(new Date().toLocaleTimeString())}
-              className="bg-primary-main text-white px-5 py-2.5 rounded-xl font-bold text-sm hover:bg-primary-main/90 transition-all"
-            >
-              Save settings
-            </button>
-            {savedAt && <span className="text-sm text-gray-500">Saved at {savedAt}</span>}
+                  branches.map((row) => (
+                    <tr key={row.id} className="align-top hover:bg-slate-50/50">
+                      <td className="px-4 py-3">
+                        <input
+                          type="text"
+                          value={row.branch_name}
+                          onChange={(e) => updateBranchField(row.id, "branch_name", e.target.value)}
+                          className="w-full min-w-[140px] rounded-lg border border-slate-200 px-3 py-2 font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                          placeholder="Branch name"
+                        />
+                      </td>
+                      <td className="px-4 py-3">
+                        <textarea
+                          value={row.logo_url}
+                          onChange={(e) => updateBranchField(row.id, "logo_url", e.target.value)}
+                          rows={2}
+                          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                          placeholder="https://… or paste Base64 data URL"
+                        />
+                        <label className="mt-2 flex items-center gap-2 text-xs font-semibold text-slate-600 cursor-pointer">
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            onChange={(e) => void handleBranchLogoFile(row.id, e)}
+                          />
+                          <span className="rounded-lg border border-slate-200 bg-white px-2 py-1 hover:bg-slate-50">
+                            Upload logo
+                          </span>
+                        </label>
+                      </td>
+                      <td className="px-4 py-3">
+                        <textarea
+                          value={row.video_url}
+                          onChange={(e) => updateBranchField(row.id, "video_url", e.target.value)}
+                          rows={2}
+                          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                          placeholder="MP4 URL or Google Drive /preview link"
+                        />
+                      </td>
+                      <td className="px-4 py-3">
+                        <textarea
+                          value={row.notes ?? ""}
+                          onChange={(e) => updateBranchField(row.id, "notes", e.target.value)}
+                          rows={3}
+                          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-slate-700 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                          placeholder="Other parameters, contacts, hours…"
+                        />
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex flex-col gap-2 w-28">
+                          <div className="aspect-square rounded-lg border border-slate-200 bg-slate-50 overflow-hidden">
+                            {row.logo_url ? (
+                              <img
+                                src={row.logo_url}
+                                alt=""
+                                className="w-full h-full object-cover"
+                              />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center text-[10px] text-slate-400 text-center px-1">
+                                No logo
+                              </div>
+                            )}
+                          </div>
+                          {row.video_url ? (
+                            <div className="text-[10px] text-slate-500 font-medium truncate max-w-[7rem]" title={row.video_url}>
+                              Video set
+                            </div>
+                          ) : null}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <div className="flex flex-col items-end gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void saveBranchRow(row)}
+                            className="rounded-lg bg-primary-main px-3 py-1.5 text-xs font-bold text-white hover:bg-primary-main/90"
+                          >
+                            Save row
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void deleteBranchRow(row)}
+                            className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-xs font-bold text-red-700 hover:bg-red-50"
+                          >
+                            Delete
+                          </button>
+                          {rowMessage?.id === row.id ? (
+                            <span
+                              className={`text-xs font-semibold max-w-[140px] ${rowMessage.ok ? "text-emerald-700" : "text-red-600"}`}
+                            >
+                              {rowMessage.text}
+                            </span>
+                          ) : null}
+                        </div>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
           </div>
         </section>
+
+        <p className="text-xs text-slate-500">
+          Tip: use <strong className="text-slate-700">Save row</strong> after editing a branch. Video preview uses the same rules as the dashboard (e.g. Google Drive embed).
+        </p>
       </div>
     </main>
   );
@@ -1434,6 +1853,15 @@ export default function App() {
   const [videoPreview, setVideoPreview] = useState<{ name: string; url: string } | null>(null);
   const [imageUploadError, setImageUploadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [isAddTaskOpen, setIsAddTaskOpen] = useState(false);
+  const [addTaskForm, setAddTaskForm] = useState({
+    categoryId: "",
+    name: "",
+    image: "",
+    videoUrl: "",
+  });
+  const [addTaskError, setAddTaskError] = useState<string | null>(null);
+  const [addTaskImageUploadError, setAddTaskImageUploadError] = useState<string | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -1452,19 +1880,23 @@ export default function App() {
 
       setSupabaseStatus("connected");
 
-      const [{ data: categories, error: categoriesError }, { data: tasks, error: tasksError }] =
-        await Promise.all([
-          supabase
-            .from("dashboard_categories")
-            .select("id,slug,title,icon_name,color,sort_order,sub_header")
-            .order("sort_order", { ascending: true }),
-          supabase
-            .from("dashboard_tasks")
-            .select(
-              "id,category_id,task_name,image_url,urgent_text,info_text,video_url,is_special,sort_order"
-            )
-            .order("sort_order", { ascending: true }),
-        ]);
+      const [
+        { data: categories, error: categoriesError },
+        { data: tasks, error: tasksError },
+        { data: selections, error: selectionsError },
+      ] = await Promise.all([
+        supabase
+          .from("dashboard_categories")
+          .select("id,slug,title,icon_name,color,sort_order,sub_header")
+          .order("sort_order", { ascending: true }),
+        supabase
+          .from("dashboard_tasks")
+          .select(
+            "id,category_id,task_name,image_url,urgent_text,info_text,video_url,is_special,sort_order"
+          )
+          .order("sort_order", { ascending: true }),
+        supabase.from("dashboard_task_selections").select("task_id"),
+      ]);
 
       if (!mounted || categoriesError || tasksError || !categories || !tasks) {
         return;
@@ -1476,6 +1908,10 @@ export default function App() {
           tasks as DashboardTaskRow[]
         )
       );
+
+      if (!selectionsError && selections?.length) {
+        setSelectedDashboardItems(selections.map((row: { task_id: string }) => row.task_id));
+      }
     };
 
     bootstrapSupabaseData().catch(() => {
@@ -1518,9 +1954,33 @@ export default function App() {
   };
 
   const handleToggleDashboardItemSelected = (itemId: string) => {
+    const willSelect = !selectedDashboardItems.includes(itemId);
     setSelectedDashboardItems((prev) =>
-      prev.includes(itemId) ? prev.filter((id) => id !== itemId) : [...prev, itemId]
+      willSelect ? [...prev, itemId] : prev.filter((id) => id !== itemId)
     );
+
+    if (supabaseStatus !== "connected") {
+      return;
+    }
+
+    void (async () => {
+      if (willSelect) {
+        const { error } = await supabase
+          .from("dashboard_task_selections")
+          .upsert({ task_id: itemId }, { onConflict: "task_id" });
+        if (error) {
+          setSelectedDashboardItems((prev) => prev.filter((id) => id !== itemId));
+        }
+      } else {
+        const { error } = await supabase
+          .from("dashboard_task_selections")
+          .delete()
+          .eq("task_id", itemId);
+        if (error) {
+          setSelectedDashboardItems((prev) => (prev.includes(itemId) ? prev : [...prev, itemId]));
+        }
+      }
+    })();
   };
 
   const handleOpenTaskVideo = (item: MenuItem) => {
@@ -1586,6 +2046,98 @@ export default function App() {
 
     setImageUploadError(null);
     setEditingItem(null);
+  };
+
+  const handleSaveNewTask = async () => {
+    const name = addTaskForm.name.trim();
+    const image = addTaskForm.image.trim();
+    const videoUrl = addTaskForm.videoUrl.trim();
+    if (!name || !image || !addTaskForm.categoryId) {
+      setAddTaskError("Name, image, and category are required.");
+      return;
+    }
+    setAddTaskError(null);
+
+    const category = dashboardData.find((c) => c.id === addTaskForm.categoryId);
+    if (!category) {
+      setAddTaskError("Category not found.");
+      return;
+    }
+
+    const newItem: MenuItem = {
+      id: `local-${Date.now()}`,
+      name,
+      image,
+      videoUrl: videoUrl || undefined,
+    };
+
+    if (supabaseStatus === "connected" && category.dbCategoryId) {
+      const { data: maxRow } = await supabase
+        .from("dashboard_tasks")
+        .select("sort_order")
+        .eq("category_id", category.dbCategoryId)
+        .order("sort_order", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const nextSort = ((maxRow as { sort_order: number } | null)?.sort_order ?? 0) + 1;
+
+      const { data: inserted, error } = await supabase
+        .from("dashboard_tasks")
+        .insert({
+          category_id: category.dbCategoryId,
+          task_name: name,
+          image_url: image,
+          video_url: videoUrl || null,
+          is_special: false,
+          sort_order: nextSort,
+        })
+        .select("id,task_name,image_url,video_url")
+        .single();
+
+      if (error) {
+        setAddTaskError(
+          error.message.includes("duplicate") || error.code === "23505"
+            ? "A task with this name already exists in this column."
+            : "Could not save task. Run latest DB migrations (insert policy) and try again."
+        );
+        return;
+      }
+
+      if (inserted) {
+        newItem.id = inserted.id;
+        newItem.name = inserted.task_name;
+        newItem.image = inserted.image_url;
+        newItem.videoUrl = inserted.video_url ?? undefined;
+      }
+    }
+
+    setDashboardData((prev) =>
+      prev.map((cat) =>
+        cat.id === addTaskForm.categoryId ? { ...cat, items: [...cat.items, newItem] } : cat
+      )
+    );
+    setIsAddTaskOpen(false);
+  };
+
+  const handleAddTaskImageFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFile = event.target.files?.[0];
+    if (!selectedFile) {
+      return;
+    }
+    if (!selectedFile.type.startsWith("image/")) {
+      setAddTaskImageUploadError("Please select a valid image file.");
+      return;
+    }
+    try {
+      const base64Image = await convertFileToBase64(selectedFile);
+      setAddTaskForm((prev) => ({ ...prev, image: base64Image }));
+      setAddTaskImageUploadError(null);
+    } catch {
+      setAddTaskImageUploadError("Cannot upload image. Please try another file.");
+    } finally {
+      event.target.value = "";
+    }
   };
 
   const handleImageFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -1689,12 +2241,26 @@ export default function App() {
               <Pencil className="w-5 h-5" /> {isEditingDashboard ? "Done Edit" : "Edit"}
             </motion.button>
           )}
-          <motion.button 
-            whileTap={{ scale: 0.95 }}
-            className="hidden sm:flex bg-primary-main text-white px-5 py-2.5 rounded-xl font-bold text-sm items-center gap-2 hover:bg-primary-main/90 transition-all shadow-md shadow-primary-main/10"
-          >
-            <Plus className="w-5 h-5" /> Add Task
-          </motion.button>
+          {activeTab === "checkwwork" && (
+            <motion.button
+              type="button"
+              whileTap={{ scale: 0.95 }}
+              onClick={() => {
+                setAddTaskError(null);
+                setAddTaskImageUploadError(null);
+                setAddTaskForm({
+                  categoryId: dashboardData[0]?.id ?? "",
+                  name: "",
+                  image: "",
+                  videoUrl: "",
+                });
+                setIsAddTaskOpen(true);
+              }}
+              className="flex bg-primary-main text-white px-5 py-2.5 rounded-xl font-bold text-sm items-center gap-2 hover:bg-primary-main/90 transition-all shadow-md shadow-primary-main/10"
+            >
+              <Plus className="w-5 h-5" /> Add Task
+            </motion.button>
+          )}
           
           <div className="flex items-center gap-2 border-l border-gray-200 pl-4 ml-2">
             <button className="p-2 text-gray-400 hover:bg-gray-100 rounded-xl transition-all relative">
@@ -1708,14 +2274,19 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Content Area */}
-      <div className="flex-1 overflow-hidden relative">
-        <img
-          src={BRAND_LOGO_URL}
-          alt=""
-          aria-hidden="true"
-          className="pointer-events-none select-none absolute right-6 bottom-6 w-52 h-52 object-cover rounded-full opacity-10 z-0"
-        />
+      {/* Main Content Area — centered brand watermark behind all views */}
+      <div className="flex-1 overflow-hidden relative bg-surface">
+        <div
+          className="pointer-events-none select-none absolute inset-0 z-0 flex items-center justify-center overflow-hidden"
+          aria-hidden
+        >
+          <div className="absolute inset-0 bg-[radial-gradient(ellipse_50%_45%_at_50%_50%,color-mix(in_oklab,var(--color-primary-main)_14%,transparent)_0%,transparent_62%)]" />
+          <img
+            src={BRAND_LOGO_URL}
+            alt=""
+            className="relative w-[min(72vmin,26rem)] h-[min(72vmin,26rem)] object-cover rounded-[2rem] opacity-[0.28] shadow-2xl shadow-primary-main/15 ring-1 ring-primary-main/10 saturate-[0.92] contrast-[1.08]"
+          />
+        </div>
         <AnimatePresence mode="wait">
           {activeTab === "checkwwork" ? (
             <motion.main 
@@ -1723,7 +2294,7 @@ export default function App() {
               initial={{ opacity: 0, x: -20 }}
               animate={{ opacity: 1, x: 0 }}
               exit={{ opacity: 0, x: 20 }}
-              className="w-full h-full grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 relative z-10"
+              className="w-full h-full min-h-0 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 relative z-10 bg-white/78 backdrop-blur-[3px]"
             >
               {dashboardData.map((category) => (
                 <CategoryColumn
@@ -1743,7 +2314,7 @@ export default function App() {
               initial={{ opacity: 0, x: 20 }}
               animate={{ opacity: 1, x: 0 }}
               exit={{ opacity: 0, x: -20 }}
-              className="w-full h-full relative z-10"
+              className="w-full h-full min-h-0 relative z-10 overflow-hidden bg-white/78 backdrop-blur-[3px]"
             >
               <DailyReportDashboard />
             </motion.div>
@@ -1753,7 +2324,7 @@ export default function App() {
               initial={{ opacity: 0, x: 20 }}
               animate={{ opacity: 1, x: 0 }}
               exit={{ opacity: 0, x: -20 }}
-              className="w-full h-full relative z-10"
+              className="w-full h-full min-h-0 relative z-10 overflow-hidden bg-white/78 backdrop-blur-[3px]"
             >
               <OperationsDashboard />
             </motion.div>
@@ -1763,7 +2334,7 @@ export default function App() {
               initial={{ opacity: 0, x: 20 }}
               animate={{ opacity: 1, x: 0 }}
               exit={{ opacity: 0, x: -20 }}
-              className="w-full h-full relative z-10"
+              className="w-full h-full min-h-0 relative z-10 overflow-hidden bg-white/78 backdrop-blur-[3px]"
             >
               <TableSettings />
             </motion.div>
@@ -1813,6 +2384,125 @@ export default function App() {
           <Pencil className="w-4 h-4" />
           {isEditingDashboard ? "Done Edit" : "Edit"}
         </button>
+      )}
+
+      {isAddTaskOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-2xl rounded-2xl bg-white shadow-2xl border border-gray-100">
+            <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+              <h3 className="text-xl font-bold text-gray-900">Add task</h3>
+              <button
+                type="button"
+                onClick={() => setIsAddTaskOpen(false)}
+                className="text-sm font-bold text-gray-500 hover:text-gray-700"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4">
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-gray-700">Column</span>
+                <select
+                  value={addTaskForm.categoryId}
+                  onChange={(e) =>
+                    setAddTaskForm((prev) => ({ ...prev, categoryId: e.target.value }))
+                  }
+                  className="w-full border border-gray-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-primary-main/30"
+                >
+                  {dashboardData.map((cat) => (
+                    <option key={cat.id} value={cat.id}>
+                      {cat.title}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-gray-700">Name</span>
+                <input
+                  type="text"
+                  value={addTaskForm.name}
+                  onChange={(e) => setAddTaskForm((prev) => ({ ...prev, name: e.target.value }))}
+                  className="w-full border border-gray-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-primary-main/30"
+                />
+              </label>
+
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-gray-700">Image (URL or Base64)</span>
+                <input
+                  type="text"
+                  value={addTaskForm.image}
+                  onChange={(e) => {
+                    setAddTaskForm((prev) => ({ ...prev, image: e.target.value }));
+                    if (addTaskImageUploadError) {
+                      setAddTaskImageUploadError(null);
+                    }
+                  }}
+                  className="w-full border border-gray-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-primary-main/30"
+                />
+              </label>
+
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-gray-700">Upload image as Base64</span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={handleAddTaskImageFileChange}
+                  className="w-full border border-gray-200 rounded-xl px-4 py-2.5 file:mr-3 file:rounded-lg file:border-0 file:bg-primary-main/10 file:px-3 file:py-1.5 file:text-primary-main file:font-bold hover:file:bg-primary-main/20"
+                />
+                {addTaskImageUploadError && (
+                  <p className="text-sm text-red-600">{addTaskImageUploadError}</p>
+                )}
+              </label>
+
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-gray-700">Video URL</span>
+                <input
+                  type="url"
+                  value={addTaskForm.videoUrl}
+                  onChange={(e) => setAddTaskForm((prev) => ({ ...prev, videoUrl: e.target.value }))}
+                  className="w-full border border-gray-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-primary-main/30"
+                />
+              </label>
+              {addTaskError && <p className="text-sm text-red-600">{addTaskError}</p>}
+
+              <div className="rounded-xl border border-gray-100 p-3">
+                <p className="text-xs font-bold uppercase tracking-wider text-gray-400 mb-2">
+                  Image preview
+                </p>
+                {addTaskForm.image ? (
+                  <img
+                    src={addTaskForm.image}
+                    alt={addTaskForm.name || "Preview"}
+                    className="w-full h-44 object-cover rounded-lg bg-gray-50"
+                  />
+                ) : (
+                  <div className="w-full h-44 rounded-lg bg-gray-50 flex items-center justify-center text-gray-400 text-sm">
+                    No image yet
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="px-6 py-4 border-t border-gray-100 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setIsAddTaskOpen(false)}
+                className="px-4 py-2 rounded-lg font-bold text-gray-600 hover:bg-gray-100"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleSaveNewTask()}
+                className="px-5 py-2.5 rounded-lg font-bold text-white bg-primary-main hover:bg-primary-main/90"
+              >
+                Add task
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {editingItem && (

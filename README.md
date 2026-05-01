@@ -25,9 +25,15 @@ Run this SQL in Supabase SQL Editor:
 
 - `supabase/migrations/20260427_create_checklist_schema.sql`
 - `supabase/migrations/20260428_add_dashboard_task_video_url.sql`
+- `supabase/migrations/20260429_dashboard_task_selections.sql`
+- `supabase/migrations/20260430_dashboard_tasks_insert_policy.sql`
+- `supabase/migrations/20260501_create_app_users.sql`
+- `supabase/migrations/20260502_branch_settings.sql`
 
 This migration creates:
 
 - `dashboard_categories` and `dashboard_tasks` for the 3 dashboard columns.
 - `checklist_templates` for Operations > Checklist work (opening/closing).
 - `checklist_completions` and view `v_checklist_done` for Operations > Checklist DONE.
+- `app_users` for local app logins: `username`, `password_hash` (bcrypt via `crypt`), `branch_name`.
+- `branch_settings` for per-branch logo, video URL, and notes on Settings.

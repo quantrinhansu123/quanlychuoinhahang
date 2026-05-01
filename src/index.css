@@ -5,12 +5,13 @@
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-display: "Plus Jakarta Sans", sans-serif;
 
-  --color-surface: #f8f9ff;
-  --color-on-background: #121c2a;
-  
-  --color-primary-main: #006c49;
-  --color-secondary-main: #0058be;
-  --color-tertiary-main: #b02d29;
+  /* ASEER TIME logo: circle #EF4423 / #F15A24, white type; citrus accent */
+  --color-surface: #fff8f5;
+  --color-on-background: #271815;
+
+  --color-primary-main: #ef4423;
+  --color-secondary-main: #c73d24;
+  --color-tertiary-main: #f59e0b;
 
   --radius-xl: 0.75rem;
   --radius-2xl: 1rem;
