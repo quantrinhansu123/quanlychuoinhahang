@@ -28,19 +28,21 @@ import {
   Users,
   ClipboardList,
   CalendarRange,
-  Search
+  Search,
+  Star
 } from "lucide-react";
 import { supabase } from "./lib/supabase";
 
 const BRAND_LOGO_URL =
   "https://www.appsheet.com/template/gettablefileurl?appName=Appsheet-325045268&tableName=Kho%20%E1%BA%A3nh&fileName=Kho%20%E1%BA%A3nh_Images%2Fa149df68.%E1%BA%A2nh.173719.jpg";
 
-type AppTab = "checkwwork" | "dashboard" | "operations" | "settings";
+type AppTab = "checkwwork" | "dashboard" | "operations" | "evaluation" | "settings";
 
 const TAB_TO_PATH: Record<AppTab, string> = {
   checkwwork: "/checkwwork",
   dashboard: "/dashboard",
   operations: "/operations",
+  evaluation: "/evaluation",
   settings: "/settings",
 };
 
@@ -53,6 +55,9 @@ const getTabFromPath = (pathname: string): AppTab => {
   }
   if (pathname.startsWith("/operations")) {
     return "operations";
+  }
+  if (pathname.startsWith("/evaluation")) {
+    return "evaluation";
   }
   if (pathname.startsWith("/settings")) {
     return "settings";
@@ -1553,8 +1558,950 @@ interface BranchSettingRow {
   sort_order: number;
 }
 
-const TableSettings = () => {
+interface EvaluationCriterionRow {
+  id: string;
+  label: string;
+  description: string | null;
+  max_score: number;
+  sort_order: number;
+  is_active: boolean;
+}
+
+interface StaffMemberRow {
+  id: string;
+  full_name: string;
+  branch_name: string;
+  role: string | null;
+  phone: string | null;
+  sort_order: number;
+  is_active: boolean;
+}
+
+type SettingsSection = "branches" | "criteria" | "staff";
+
+const todayIsoDate = () => new Date().toISOString().slice(0, 10);
+
+const PercentSlider = ({
+  value,
+  onChange,
+  accent = "primary",
+}: {
+  value: number;
+  onChange: (value: number) => void;
+  accent?: "primary" | "manager";
+}) => {
+  const barClass =
+    accent === "manager"
+      ? "accent-violet-600 [&::-webkit-slider-runnable-track]:bg-violet-100"
+      : "accent-primary-main [&::-webkit-slider-runnable-track]:bg-slate-100";
+
+  return (
+    <div className="flex items-center gap-3 min-w-[180px]">
+      <input
+        type="range"
+        min={0}
+        max={100}
+        step={1}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className={`flex-1 h-2 rounded-full cursor-pointer ${barClass}`}
+      />
+      <span
+        className={`w-12 text-right text-sm font-bold tabular-nums shrink-0 ${
+          accent === "manager" ? "text-violet-700" : "text-primary-main"
+        }`}
+      >
+        {value}%
+      </span>
+    </div>
+  );
+};
+
+const StaffEvaluationPanel = () => {
+  const [staffList, setStaffList] = useState<StaffMemberRow[]>([]);
+  const [criteria, setCriteria] = useState<EvaluationCriterionRow[]>([]);
+  const [selectedStaffId, setSelectedStaffId] = useState("");
+  const [evaluationDate, setEvaluationDate] = useState(todayIsoDate);
+  const [percents, setPercents] = useState<Record<string, number>>({});
+  const [managerPercent, setManagerPercent] = useState(0);
+  const [evaluatorName, setEvaluatorName] = useState("");
+  const [managerName, setManagerName] = useState("");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saveMessage, setSaveMessage] = useState<{ text: string; ok: boolean } | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+
+  const loadData = async () => {
+    setLoadError(null);
+    const [{ data: staffData, error: staffError }, { data: criteriaData, error: criteriaError }] =
+      await Promise.all([
+        supabase
+          .from("staff_members")
+          .select("id,full_name,branch_name,role,phone,sort_order,is_active")
+          .eq("is_active", true)
+          .order("sort_order", { ascending: true }),
+        supabase
+          .from("evaluation_criteria")
+          .select("id,label,description,max_score,sort_order,is_active")
+          .eq("is_active", true)
+          .order("sort_order", { ascending: true }),
+      ]);
+
+    if (staffError || criteriaError) {
+      setLoadError(
+        "Could not load data. Run migration 20260503_staff_evaluation.sql in Supabase."
+      );
+      return;
+    }
+
+    const staffRows = (staffData ?? []) as StaffMemberRow[];
+    const criteriaRows = (criteriaData ?? []) as EvaluationCriterionRow[];
+    setStaffList(staffRows);
+    setCriteria(criteriaRows);
+    if (!selectedStaffId && staffRows.length > 0) {
+      setSelectedStaffId(staffRows[0].id);
+    }
+  };
+
+  const loadScoresForStaff = async (
+    staffId: string,
+    date: string,
+    criteriaRows: EvaluationCriterionRow[]
+  ) => {
+    if (!staffId) {
+      setPercents({});
+      setManagerPercent(0);
+      setManagerName("");
+      return;
+    }
+    const [{ data: evalData, error: evalError }, { data: managerData, error: managerError }] =
+      await Promise.all([
+        supabase
+          .from("staff_evaluations")
+          .select("criterion_id,score,evaluator_name")
+          .eq("staff_id", staffId)
+          .eq("evaluation_date", date),
+        supabase
+          .from("staff_evaluation_manager")
+          .select("manager_percent,manager_name")
+          .eq("staff_id", staffId)
+          .eq("evaluation_date", date)
+          .maybeSingle(),
+      ]);
+
+    if (evalError) {
+      setPercents({});
+      return;
+    }
+
+    const next: Record<string, number> = {};
+    let loadedEvaluator = "";
+    for (const row of evalData ?? []) {
+      next[row.criterion_id as string] = row.score as number;
+      if (row.evaluator_name) {
+        loadedEvaluator = row.evaluator_name as string;
+      }
+    }
+    for (const c of criteriaRows) {
+      if (next[c.id] == null) {
+        next[c.id] = 0;
+      }
+    }
+    setPercents(next);
+    if (loadedEvaluator) {
+      setEvaluatorName(loadedEvaluator);
+    }
+
+    if (!managerError && managerData) {
+      setManagerPercent(managerData.manager_percent as number);
+      setManagerName((managerData.manager_name as string) ?? "");
+    } else {
+      setManagerPercent(0);
+      setManagerName("");
+    }
+  };
+
+  useEffect(() => {
+    void loadData();
+  }, []);
+
+  useEffect(() => {
+    if (selectedStaffId && criteria.length > 0) {
+      void loadScoresForStaff(selectedStaffId, evaluationDate, criteria);
+    }
+  }, [selectedStaffId, evaluationDate, criteria]);
+
+  const setCriterionPercent = (criterionId: string, percent: number) => {
+    setPercents((prev) => ({ ...prev, [criterionId]: percent }));
+    setSaveMessage(null);
+  };
+
+  const handleSave = async () => {
+    if (!selectedStaffId) {
+      setSaveMessage({ text: "Please select a staff member.", ok: false });
+      return;
+    }
+    const missing = criteria.filter((c) => percents[c.id] == null);
+    if (missing.length > 0) {
+      setSaveMessage({ text: "Please set the percentage slider for every criterion.", ok: false });
+      return;
+    }
+
+    setIsSaving(true);
+    setSaveMessage(null);
+
+    const rows = criteria.map((c) => ({
+      staff_id: selectedStaffId,
+      criterion_id: c.id,
+      score: percents[c.id],
+      evaluation_date: evaluationDate,
+      evaluator_name: evaluatorName.trim() || null,
+      updated_at: new Date().toISOString(),
+    }));
+
+    const [{ error: evalError }, { error: managerError }] = await Promise.all([
+      supabase.from("staff_evaluations").upsert(rows, {
+        onConflict: "staff_id,criterion_id,evaluation_date",
+      }),
+      supabase.from("staff_evaluation_manager").upsert(
+        {
+          staff_id: selectedStaffId,
+          evaluation_date: evaluationDate,
+          manager_percent: managerPercent,
+          manager_name: managerName.trim() || null,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "staff_id,evaluation_date" }
+      ),
+    ]);
+
+    setIsSaving(false);
+    if (evalError || managerError) {
+      setSaveMessage({
+        text: managerError?.message?.includes("staff_evaluation_manager")
+          ? "Save failed. Run migration 20260504_evaluation_percent.sql."
+          : "Save failed. Check Supabase policies.",
+        ok: false,
+      });
+      return;
+    }
+    setSaveMessage({ text: "Evaluation saved.", ok: true });
+  };
+
+  const selectedStaff = staffList.find((s) => s.id === selectedStaffId);
+  const ratedCount = criteria.filter((c) => percents[c.id] != null).length;
+  const averagePercent =
+    ratedCount > 0
+      ? Math.round(
+          criteria.reduce((sum, c) => sum + (percents[c.id] ?? 0), 0) / ratedCount
+        )
+      : null;
+
+  return (
+    <div className="flex-1 overflow-y-auto p-4 md:p-8 scrollbar-hide">
+      <div className="max-w-4xl mx-auto space-y-6">
+        <div>
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400 mb-1">
+            Staff evaluation
+          </p>
+          <h2 className="text-2xl font-display font-bold text-slate-900 mb-1">
+            Score by day
+          </h2>
+          <p className="text-slate-600 text-sm">
+            Pick a date and staff member, then drag the percentage slider for each criterion. Manager sign-off is a separate column.
+          </p>
+        </div>
+
+        {loadError && (
+          <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-800">
+            {loadError}
+          </div>
+        )}
+
+        {staffList.length === 0 && !loadError ? (
+          <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-6 text-sm text-amber-900">
+            No staff yet. Go to <strong>Settings → Staff</strong> to add employees.
+          </div>
+        ) : null}
+
+        {criteria.length === 0 && !loadError ? (
+          <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-6 text-sm text-amber-900">
+            No evaluation criteria yet. Go to <strong>Settings → Evaluation criteria</strong> to add some.
+          </div>
+        ) : null}
+
+        {staffList.length > 0 && criteria.length > 0 ? (
+          <>
+            <div className="grid gap-4 sm:grid-cols-3">
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-slate-700">Evaluation date</span>
+                <input
+                  type="date"
+                  value={evaluationDate}
+                  onChange={(e) => setEvaluationDate(e.target.value)}
+                  className="w-full rounded-xl border border-slate-200 px-4 py-2.5 font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                />
+              </label>
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-slate-700">Staff</span>
+                <select
+                  value={selectedStaffId}
+                  onChange={(e) => setSelectedStaffId(e.target.value)}
+                  className="w-full rounded-xl border border-slate-200 px-4 py-2.5 font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                >
+                  {staffList.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.full_name}
+                      {s.branch_name ? ` · ${s.branch_name}` : ""}
+                      {s.role ? ` · ${s.role}` : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-slate-700">Evaluator</span>
+                <input
+                  type="text"
+                  value={evaluatorName}
+                  onChange={(e) => setEvaluatorName(e.target.value)}
+                  placeholder="Shift lead / evaluator"
+                  className="w-full rounded-xl border border-slate-200 px-4 py-2.5 text-slate-900 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                />
+              </label>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-slate-50 border border-slate-200 px-4 py-3 text-sm">
+              <span className="text-slate-600">
+                Criteria avg:{" "}
+                <strong className="text-primary-main text-lg">
+                  {averagePercent != null ? `${averagePercent}%` : "—"}
+                </strong>
+                <span className="text-slate-400 ml-1">
+                  ({ratedCount}/{criteria.length})
+                </span>
+              </span>
+              <span className="text-slate-600">
+                Manager sign-off:{" "}
+                <strong className="text-violet-700 text-lg">{managerPercent}%</strong>
+              </span>
+            </div>
+
+            <section className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-slate-200 bg-slate-50/90">
+                      <th className="px-4 py-3 font-bold text-slate-700 min-w-[160px]">Criterion</th>
+                      <th className="px-4 py-3 font-bold text-slate-700 min-w-[220px]">Percent</th>
+                      <th className="px-4 py-3 font-bold text-violet-800 min-w-[220px]">
+                        Manager sign-off
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {criteria.map((criterion) => (
+                      <tr key={criterion.id} className="hover:bg-slate-50/50">
+                        <td className="px-4 py-4 align-middle">
+                          <p className="font-bold text-slate-900">{criterion.label}</p>
+                          {criterion.description ? (
+                            <p className="text-xs text-slate-500 mt-0.5">{criterion.description}</p>
+                          ) : null}
+                        </td>
+                        <td className="px-4 py-4 align-middle">
+                          <PercentSlider
+                            value={percents[criterion.id] ?? 0}
+                            onChange={(v) => setCriterionPercent(criterion.id, v)}
+                          />
+                        </td>
+                        <td className="px-4 py-4 align-middle text-slate-300 text-xs">—</td>
+                      </tr>
+                    ))}
+                    <tr className="bg-violet-50/60 border-t-2 border-violet-200">
+                      <td className="px-4 py-4 align-middle">
+                        <p className="font-bold text-violet-900">Manager sign-off</p>
+                        <input
+                          type="text"
+                          value={managerName}
+                          onChange={(e) => {
+                            setManagerName(e.target.value);
+                            setSaveMessage(null);
+                          }}
+                          placeholder="Manager name"
+                          className="mt-2 w-full max-w-[200px] rounded-lg border border-violet-200 bg-white px-3 py-1.5 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-violet-300/50"
+                        />
+                      </td>
+                      <td className="px-4 py-4 align-middle text-slate-300 text-xs">—</td>
+                      <td className="px-4 py-4 align-middle">
+                        <PercentSlider
+                          value={managerPercent}
+                          onChange={(v) => {
+                            setManagerPercent(v);
+                            setSaveMessage(null);
+                          }}
+                          accent="manager"
+                        />
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 pt-2">
+              <button
+                type="button"
+                disabled={isSaving}
+                onClick={() => void handleSave()}
+                className="inline-flex justify-center items-center gap-2 rounded-xl bg-primary-main px-6 py-3 text-sm font-bold text-white shadow-sm hover:bg-primary-main/90 disabled:opacity-60"
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                {isSaving ? "Saving…" : "Save evaluation"}
+              </button>
+              {saveMessage ? (
+                <span
+                  className={`text-sm font-semibold ${saveMessage.ok ? "text-emerald-700" : "text-red-600"}`}
+                >
+                  {saveMessage.text}
+                </span>
+              ) : null}
+              {selectedStaff ? (
+                <span className="text-xs text-slate-500 sm:ml-auto">
+                  {selectedStaff.full_name} · {evaluationDate}
+                </span>
+              ) : null}
+            </div>
+          </>
+        ) : null}
+      </div>
+    </div>
+  );
+};
+
+type EvaluationSubTab = "score" | "results" | "staff";
+
+const StaffListPanel = () => {
+  const [staffList, setStaffList] = useState<StaffMemberRow[]>([]);
   const [branches, setBranches] = useState<BranchSettingRow[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [isAddOpen, setIsAddOpen] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+  const [addForm, setAddForm] = useState({
+    full_name: "",
+    branch_name: "Main branch",
+    role: "",
+    phone: "",
+    password: "",
+  });
+
+  const loadStaff = async () => {
+    setLoadError(null);
+    const { data, error } = await supabase
+      .from("staff_members")
+      .select("id,full_name,branch_name,role,phone,sort_order,is_active")
+      .order("sort_order", { ascending: true });
+
+    if (error) {
+      setLoadError("Could not load staff. Run migration 20260505_staff_users.sql.");
+      return;
+    }
+    setStaffList((data ?? []) as StaffMemberRow[]);
+  };
+
+  const loadBranches = async () => {
+    const { data } = await supabase
+      .from("branch_settings")
+      .select("id,branch_name,logo_url,video_url,notes,sort_order")
+      .order("sort_order", { ascending: true });
+    const rows = (data ?? []) as BranchSettingRow[];
+    setBranches(rows);
+    if (rows.length > 0) {
+      setAddForm((prev) => ({
+        ...prev,
+        branch_name: prev.branch_name || rows[0].branch_name,
+      }));
+    }
+  };
+
+  useEffect(() => {
+    void loadStaff();
+    void loadBranches();
+  }, []);
+
+  const openAddModal = () => {
+    setAddError(null);
+    setAddForm({
+      full_name: "",
+      branch_name: branches[0]?.branch_name ?? "Main branch",
+      role: "",
+      phone: "",
+      password: "",
+    });
+    setIsAddOpen(true);
+  };
+
+  const handleAddStaff = async () => {
+    const name = addForm.full_name.trim();
+    const branch = addForm.branch_name.trim();
+    if (!name) {
+      setAddError("Full name is required.");
+      return;
+    }
+    if (!branch) {
+      setAddError("Branch is required.");
+      return;
+    }
+
+    setIsSaving(true);
+    setAddError(null);
+
+    const nextOrder =
+      staffList.length > 0 ? Math.max(...staffList.map((s) => s.sort_order)) + 1 : 0;
+
+    const insertPayload: Record<string, unknown> = {
+      full_name: name,
+      branch_name: branch,
+      role: addForm.role.trim() || null,
+      phone: addForm.phone.trim() || null,
+      sort_order: nextOrder,
+      is_active: true,
+    };
+
+    const plainPassword = addForm.password.trim();
+    if (plainPassword) {
+      const { data: hash, error: hashError } = await supabase.rpc("hash_password", {
+        plain_password: plainPassword,
+      });
+      if (hashError || !hash) {
+        setIsSaving(false);
+        setAddError("Could not set password. Run migration 20260505_staff_users.sql.");
+        return;
+      }
+      insertPayload.password_hash = hash;
+    }
+
+    const { error } = await supabase.from("staff_members").insert(insertPayload);
+
+    setIsSaving(false);
+    if (error) {
+      setAddError(
+        error.code === "23505" ? "This staff name already exists." : "Could not add staff."
+      );
+      return;
+    }
+
+    setIsAddOpen(false);
+    await loadStaff();
+  };
+
+  return (
+    <div className="flex-1 overflow-y-auto p-4 md:p-8 scrollbar-hide">
+      <div className="max-w-5xl mx-auto space-y-6">
+        <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
+          <div>
+            <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400 mb-1">Directory</p>
+            <h2 className="text-2xl font-display font-bold text-slate-900 mb-1">Staff list</h2>
+            <p className="text-slate-600 text-sm">
+              All staff and user accounts. Edit details in Settings → Staff &amp; users.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={openAddModal}
+            className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary-main px-5 py-2.5 text-sm font-bold text-white shadow-sm hover:bg-primary-main/90 transition-all shrink-0"
+          >
+            <Plus className="w-4 h-4" />
+            Add new staff
+          </button>
+        </div>
+
+        {loadError && (
+          <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-800">
+            {loadError}
+          </div>
+        )}
+
+        <section className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="border-b border-slate-200 bg-slate-50/90">
+                  <th className="px-4 py-3 font-bold text-slate-700">Full name</th>
+                  <th className="px-4 py-3 font-bold text-slate-700">Branch</th>
+                  <th className="px-4 py-3 font-bold text-slate-700">Role</th>
+                  <th className="px-4 py-3 font-bold text-slate-700">Phone</th>
+                  <th className="px-4 py-3 font-bold text-slate-700">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {staffList.length === 0 && !loadError ? (
+                  <tr>
+                    <td colSpan={5} className="px-4 py-10 text-center text-slate-500">
+                      No staff yet. Click &quot;Add new staff&quot; to get started.
+                    </td>
+                  </tr>
+                ) : (
+                  staffList.map((row) => (
+                    <tr key={row.id} className="hover:bg-slate-50/50">
+                      <td className="px-4 py-3 font-semibold text-slate-900">{row.full_name}</td>
+                      <td className="px-4 py-3 text-slate-700">{row.branch_name}</td>
+                      <td className="px-4 py-3 text-slate-600">{row.role ?? "—"}</td>
+                      <td className="px-4 py-3 text-slate-600">{row.phone ?? "—"}</td>
+                      <td className="px-4 py-3">
+                        <span
+                          className={`inline-flex rounded-full px-2.5 py-0.5 text-xs font-bold ${
+                            row.is_active
+                              ? "bg-emerald-100 text-emerald-800"
+                              : "bg-slate-100 text-slate-500"
+                          }`}
+                        >
+                          {row.is_active ? "Active" : "Inactive"}
+                        </span>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      {isAddOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white shadow-2xl border border-gray-100">
+            <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+              <h3 className="text-xl font-bold text-gray-900">Add new staff</h3>
+              <button
+                type="button"
+                onClick={() => setIsAddOpen(false)}
+                className="text-sm font-bold text-gray-500 hover:text-gray-700"
+              >
+                Close
+              </button>
+            </div>
+            <div className="p-6 space-y-4">
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-gray-700">Full name</span>
+                <input
+                  type="text"
+                  value={addForm.full_name}
+                  onChange={(e) => setAddForm((prev) => ({ ...prev, full_name: e.target.value }))}
+                  className="w-full border border-gray-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-primary-main/30"
+                  placeholder="Employee name"
+                />
+              </label>
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-gray-700">Branch</span>
+                <select
+                  value={addForm.branch_name}
+                  onChange={(e) => setAddForm((prev) => ({ ...prev, branch_name: e.target.value }))}
+                  className="w-full border border-gray-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-primary-main/30"
+                >
+                  {branches.length === 0 ? (
+                    <option value="Main branch">Main branch</option>
+                  ) : (
+                    branches.map((b) => (
+                      <option key={b.id} value={b.branch_name}>
+                        {b.branch_name}
+                      </option>
+                    ))
+                  )}
+                </select>
+              </label>
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-gray-700">Role</span>
+                <input
+                  type="text"
+                  value={addForm.role}
+                  onChange={(e) => setAddForm((prev) => ({ ...prev, role: e.target.value }))}
+                  className="w-full border border-gray-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-primary-main/30"
+                  placeholder="Barista, server…"
+                />
+              </label>
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-gray-700">Phone</span>
+                <input
+                  type="tel"
+                  value={addForm.phone}
+                  onChange={(e) => setAddForm((prev) => ({ ...prev, phone: e.target.value }))}
+                  className="w-full border border-gray-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-primary-main/30"
+                  placeholder="+84…"
+                />
+              </label>
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-gray-700">Password (optional)</span>
+                <input
+                  type="password"
+                  value={addForm.password}
+                  onChange={(e) => setAddForm((prev) => ({ ...prev, password: e.target.value }))}
+                  className="w-full border border-gray-200 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-primary-main/30"
+                  placeholder="Login password"
+                  autoComplete="new-password"
+                />
+              </label>
+              {addError ? (
+                <p className="text-sm font-semibold text-red-600">{addError}</p>
+              ) : null}
+              <button
+                type="button"
+                disabled={isSaving}
+                onClick={() => void handleAddStaff()}
+                className="w-full rounded-xl bg-primary-main px-4 py-3 text-sm font-bold text-white hover:bg-primary-main/90 disabled:opacity-60"
+              >
+                {isSaving ? "Saving…" : "Add staff"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const StaffEvaluationResultsPanel = () => {
+  const [filterDate, setFilterDate] = useState(todayIsoDate);
+  const [staffList, setStaffList] = useState<StaffMemberRow[]>([]);
+  const [criteria, setCriteria] = useState<EvaluationCriterionRow[]>([]);
+  const [evaluations, setEvaluations] = useState<
+    { staff_id: string; criterion_id: string; score: number; evaluator_name: string | null }[]
+  >([]);
+  const [managerByStaff, setManagerByStaff] = useState<
+    Record<string, { percent: number; name: string | null }>
+  >({});
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const loadResults = async (date: string) => {
+    setLoadError(null);
+    const [
+      { data: staffData, error: staffError },
+      { data: criteriaData, error: criteriaError },
+      { data: evalData, error: evalError },
+      { data: managerData, error: managerError },
+    ] = await Promise.all([
+      supabase.from("staff_members").select("id,full_name,branch_name,role,phone,sort_order,is_active").order("sort_order"),
+      supabase.from("evaluation_criteria").select("id,label,max_score,sort_order,is_active").order("sort_order"),
+      supabase
+        .from("staff_evaluations")
+        .select("staff_id,criterion_id,score,evaluator_name")
+        .eq("evaluation_date", date),
+      supabase
+        .from("staff_evaluation_manager")
+        .select("staff_id,manager_percent,manager_name")
+        .eq("evaluation_date", date),
+    ]);
+
+    if (staffError || criteriaError || evalError) {
+      setLoadError("Could not load results. Run migration 20260503_staff_evaluation.sql.");
+      return;
+    }
+
+    setStaffList((staffData ?? []) as StaffMemberRow[]);
+    setCriteria((criteriaData ?? []) as EvaluationCriterionRow[]);
+    setEvaluations(
+      (evalData ?? []) as {
+        staff_id: string;
+        criterion_id: string;
+        score: number;
+        evaluator_name: string | null;
+      }[]
+    );
+
+    const managerMap: Record<string, { percent: number; name: string | null }> = {};
+    if (!managerError) {
+      for (const row of managerData ?? []) {
+        managerMap[row.staff_id as string] = {
+          percent: row.manager_percent as number,
+          name: (row.manager_name as string) ?? null,
+        };
+      }
+    }
+    setManagerByStaff(managerMap);
+  };
+
+  useEffect(() => {
+    void loadResults(filterDate);
+  }, [filterDate]);
+
+  const staffById = Object.fromEntries(staffList.map((s) => [s.id, s]));
+
+  const groupedByStaff = evaluations.reduce<
+    Record<string, { scores: Record<string, number>; evaluator: string | null }>
+  >((acc, row) => {
+    if (!acc[row.staff_id]) {
+      acc[row.staff_id] = { scores: {}, evaluator: row.evaluator_name };
+    }
+    acc[row.staff_id].scores[row.criterion_id] = row.score;
+    if (row.evaluator_name) {
+      acc[row.staff_id].evaluator = row.evaluator_name;
+    }
+    return acc;
+  }, {});
+
+  const resultRows = Object.entries(groupedByStaff)
+    .map(([staffId, data]) => {
+      const staff = staffById[staffId];
+      const scoreValues = Object.values(data.scores);
+      const average =
+        scoreValues.length > 0
+          ? Math.round(scoreValues.reduce((a, b) => a + b, 0) / scoreValues.length)
+          : null;
+      const manager = managerByStaff[staffId];
+      return { staffId, staff, data, average, manager };
+    })
+    .filter((row) => row.staff)
+    .sort((a, b) => (a.staff?.sort_order ?? 0) - (b.staff?.sort_order ?? 0));
+
+  return (
+    <div className="flex-1 overflow-y-auto p-4 md:p-8 scrollbar-hide">
+      <div className="max-w-4xl mx-auto space-y-6">
+        <div>
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400 mb-1">Results</p>
+          <h2 className="text-2xl font-display font-bold text-slate-900 mb-1">Evaluation report</h2>
+          <p className="text-slate-600 text-sm">View staff evaluation scores by day.</p>
+        </div>
+
+        <label className="inline-flex flex-col gap-2">
+          <span className="text-sm font-bold text-slate-700">Date</span>
+          <input
+            type="date"
+            value={filterDate}
+            onChange={(e) => setFilterDate(e.target.value)}
+            className="w-fit rounded-xl border border-slate-200 px-4 py-2.5 font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+          />
+        </label>
+
+        {loadError && (
+          <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-800">
+            {loadError}
+          </div>
+        )}
+
+        {resultRows.length === 0 && !loadError ? (
+          <div className="rounded-2xl border border-slate-200 bg-white px-4 py-10 text-center text-slate-500 text-sm">
+            No evaluations on {filterDate}.
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {resultRows.map(({ staffId, staff, data, average, manager }) => (
+              <section
+                key={staffId}
+                className="rounded-2xl border border-slate-200 bg-white p-4 md:p-5 shadow-sm"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
+                  <div>
+                    <h3 className="font-bold text-slate-900 text-lg">{staff?.full_name}</h3>
+                    {staff?.role ? <p className="text-sm text-slate-500">{staff.role}</p> : null}
+                    {data.evaluator ? (
+                      <p className="text-xs text-slate-400 mt-1">Evaluated by: {data.evaluator}</p>
+                    ) : null}
+                  </div>
+                  <div className="flex gap-4 text-right">
+                    <div>
+                      <p className="text-xs font-bold uppercase text-slate-400">Criteria avg</p>
+                      <p className="text-2xl font-bold text-primary-main">
+                        {average != null ? `${average}%` : "—"}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-xs font-bold uppercase text-violet-500">Manager sign-off</p>
+                      <p className="text-2xl font-bold text-violet-700">
+                        {manager ? `${manager.percent}%` : "—"}
+                      </p>
+                      {manager?.name ? (
+                        <p className="text-[10px] text-slate-400">{manager.name}</p>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {criteria
+                    .filter((c) => c.is_active)
+                    .map((criterion) => {
+                      const score = data.scores[criterion.id];
+                      return (
+                        <div
+                          key={criterion.id}
+                          className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2 text-sm"
+                        >
+                          <span className="text-slate-700 font-medium">{criterion.label}</span>
+                          <span
+                            className={`font-bold ${score != null ? "text-emerald-700" : "text-slate-400"}`}
+                          >
+                            {score != null ? `${score}%` : "—"}
+                          </span>
+                        </div>
+                      );
+                    })}
+                </div>
+              </section>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const EvaluationPage = () => {
+  const [subTab, setSubTab] = useState<EvaluationSubTab>("score");
+
+  return (
+    <main className="w-full h-full min-h-0 flex flex-col relative z-10 bg-white/78 backdrop-blur-[3px]">
+      <div className="shrink-0 flex gap-2 p-3 md:p-4 border-b border-slate-200/80 bg-white/90">
+        <button
+          type="button"
+          onClick={() => setSubTab("score")}
+          className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold transition-all ${
+            subTab === "score"
+              ? "bg-primary-main text-white shadow-sm"
+              : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+          }`}
+        >
+          <Star className="w-4 h-4" />
+          Score
+        </button>
+        <button
+          type="button"
+          onClick={() => setSubTab("results")}
+          className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold transition-all ${
+            subTab === "results"
+              ? "bg-primary-main text-white shadow-sm"
+              : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+          }`}
+        >
+          <FileText className="w-4 h-4" />
+          Results
+        </button>
+        <button
+          type="button"
+          onClick={() => setSubTab("staff")}
+          className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold transition-all ${
+            subTab === "staff"
+              ? "bg-primary-main text-white shadow-sm"
+              : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+          }`}
+        >
+          <Users className="w-4 h-4" />
+          Staff list
+        </button>
+      </div>
+      {subTab === "score" ? (
+        <StaffEvaluationPanel />
+      ) : subTab === "results" ? (
+        <StaffEvaluationResultsPanel />
+      ) : (
+        <StaffListPanel />
+      )}
+    </main>
+  );
+};
+
+const TableSettings = () => {
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("branches");
+  const [branches, setBranches] = useState<BranchSettingRow[]>([]);
+  const [criteria, setCriteria] = useState<EvaluationCriterionRow[]>([]);
+  const [staffMembers, setStaffMembers] = useState<StaffMemberRow[]>([]);
+  const [passwordDrafts, setPasswordDrafts] = useState<Record<string, string>>({});
   const [loadError, setLoadError] = useState<string | null>(null);
   const [rowMessage, setRowMessage] = useState<{ id: string; text: string; ok: boolean } | null>(null);
 
@@ -1573,9 +2520,224 @@ const TableSettings = () => {
     setBranches((data ?? []) as BranchSettingRow[]);
   };
 
+  const loadCriteria = async () => {
+    const { data, error } = await supabase
+      .from("evaluation_criteria")
+      .select("id,label,description,max_score,sort_order,is_active")
+      .order("sort_order", { ascending: true });
+
+    if (error) {
+      setLoadError("Could not load criteria. Run migration 20260503_staff_evaluation.sql.");
+      setCriteria([]);
+      return;
+    }
+    setCriteria((data ?? []) as EvaluationCriterionRow[]);
+  };
+
+  const loadStaffMembers = async () => {
+    const { data, error } = await supabase
+      .from("staff_members")
+      .select("id,full_name,branch_name,role,phone,sort_order,is_active")
+      .order("sort_order", { ascending: true });
+
+    if (error) {
+      setLoadError("Could not load staff. Run migration 20260505_staff_users.sql.");
+      setStaffMembers([]);
+      return;
+    }
+    setStaffMembers((data ?? []) as StaffMemberRow[]);
+  };
+
   useEffect(() => {
     void loadBranches();
+    void loadCriteria();
+    void loadStaffMembers();
   }, []);
+
+  const updateCriterionField = (
+    id: string,
+    field: keyof EvaluationCriterionRow,
+    value: string | number | boolean
+  ) => {
+    setCriteria((prev) =>
+      prev.map((row) => (row.id === id ? { ...row, [field]: value } : row))
+    );
+    setRowMessage(null);
+  };
+
+  const saveCriterionRow = async (row: EvaluationCriterionRow) => {
+    setRowMessage(null);
+    const label = row.label.trim();
+    if (!label) {
+      setRowMessage({ id: row.id, text: "Criterion name is required.", ok: false });
+      return;
+    }
+    const { error } = await supabase
+      .from("evaluation_criteria")
+      .update({
+        label,
+        description: row.description?.trim() || null,
+        max_score: row.max_score,
+        sort_order: row.sort_order,
+        is_active: row.is_active,
+      })
+      .eq("id", row.id);
+
+    if (error) {
+      setRowMessage({
+        id: row.id,
+        text: error.code === "23505" ? "This criterion already exists." : "Save failed.",
+        ok: false,
+      });
+      return;
+    }
+    setRowMessage({ id: row.id, text: "Saved.", ok: true });
+    await loadCriteria();
+  };
+
+  const addCriterion = async () => {
+    setRowMessage(null);
+    const nextOrder =
+      criteria.length > 0 ? Math.max(...criteria.map((c) => c.sort_order)) + 1 : 0;
+    const { data, error } = await supabase
+      .from("evaluation_criteria")
+      .insert({
+        label: `New criterion ${nextOrder + 1}`,
+        description: "",
+        max_score: 5,
+        sort_order: nextOrder,
+        is_active: true,
+      })
+      .select("id,label,description,max_score,sort_order,is_active")
+      .single();
+
+    if (error || !data) {
+      setLoadError("Could not add criterion.");
+      return;
+    }
+    setCriteria((prev) => [...prev, data as EvaluationCriterionRow]);
+    setRowMessage({ id: (data as EvaluationCriterionRow).id, text: "Added — edit and Save.", ok: true });
+  };
+
+  const deleteCriterionRow = async (row: EvaluationCriterionRow) => {
+    if (!window.confirm(`Delete criterion "${row.label}"?`)) {
+      return;
+    }
+    const { error } = await supabase.from("evaluation_criteria").delete().eq("id", row.id);
+    if (error) {
+      setRowMessage({ id: row.id, text: "Delete failed.", ok: false });
+      return;
+    }
+    setCriteria((prev) => prev.filter((c) => c.id !== row.id));
+  };
+
+  const updateStaffField = (
+    id: string,
+    field: keyof StaffMemberRow,
+    value: string | number | boolean
+  ) => {
+    setStaffMembers((prev) =>
+      prev.map((row) => (row.id === id ? { ...row, [field]: value } : row))
+    );
+    setRowMessage(null);
+  };
+
+  const saveStaffRow = async (row: StaffMemberRow) => {
+    setRowMessage(null);
+    const name = row.full_name.trim();
+    const branch = row.branch_name.trim();
+    if (!name) {
+      setRowMessage({ id: row.id, text: "Staff name is required.", ok: false });
+      return;
+    }
+    if (!branch) {
+      setRowMessage({ id: row.id, text: "Branch is required.", ok: false });
+      return;
+    }
+
+    const payload: Record<string, unknown> = {
+      full_name: name,
+      branch_name: branch,
+      role: row.role?.trim() || null,
+      phone: row.phone?.trim() || null,
+      sort_order: row.sort_order,
+      is_active: row.is_active,
+    };
+
+    const plainPassword = passwordDrafts[row.id]?.trim();
+    if (plainPassword) {
+      const { data: hash, error: hashError } = await supabase.rpc("hash_password", {
+        plain_password: plainPassword,
+      });
+      if (hashError || !hash) {
+        setRowMessage({
+          id: row.id,
+          text: hashError?.message?.includes("hash_password")
+            ? "Password save failed. Run migration 20260505_staff_users.sql."
+            : "Could not hash password.",
+          ok: false,
+        });
+        return;
+      }
+      payload.password_hash = hash;
+    }
+
+    const { error } = await supabase.from("staff_members").update(payload).eq("id", row.id);
+
+    if (error) {
+      setRowMessage({
+        id: row.id,
+        text: error.code === "23505" ? "This staff name already exists." : "Save failed.",
+        ok: false,
+      });
+      return;
+    }
+    setPasswordDrafts((prev) => {
+      const next = { ...prev };
+      delete next[row.id];
+      return next;
+    });
+    setRowMessage({ id: row.id, text: "Saved.", ok: true });
+    await loadStaffMembers();
+  };
+
+  const addStaffMember = async () => {
+    setRowMessage(null);
+    const nextOrder =
+      staffMembers.length > 0 ? Math.max(...staffMembers.map((s) => s.sort_order)) + 1 : 0;
+    const defaultBranch = branches[0]?.branch_name ?? "Main branch";
+    const { data, error } = await supabase
+      .from("staff_members")
+      .insert({
+        full_name: `New staff ${nextOrder + 1}`,
+        branch_name: defaultBranch,
+        role: "",
+        phone: "",
+        sort_order: nextOrder,
+        is_active: true,
+      })
+      .select("id,full_name,branch_name,role,phone,sort_order,is_active")
+      .single();
+
+    if (error || !data) {
+      setLoadError("Could not add staff member.");
+      return;
+    }
+    setStaffMembers((prev) => [...prev, data as StaffMemberRow]);
+    setRowMessage({ id: (data as StaffMemberRow).id, text: "Added — edit and Save.", ok: true });
+  };
+
+  const deleteStaffRow = async (row: StaffMemberRow) => {
+    if (!window.confirm(`Delete staff "${row.full_name}"?`)) {
+      return;
+    }
+    const { error } = await supabase.from("staff_members").delete().eq("id", row.id);
+    if (error) {
+      setRowMessage({ id: row.id, text: "Delete failed.", ok: false });
+      return;
+    }
+    setStaffMembers((prev) => prev.filter((s) => s.id !== row.id));
+  };
 
   const updateBranchField = (id: string, field: keyof BranchSettingRow, value: string) => {
     setBranches((prev) =>
@@ -1677,6 +2839,12 @@ const TableSettings = () => {
     setBranches((prev) => prev.filter((b) => b.id !== row.id));
   };
 
+  const settingsTabs: { id: SettingsSection; label: string }[] = [
+    { id: "branches", label: "Branches" },
+    { id: "criteria", label: "Evaluation criteria" },
+    { id: "staff", label: "Staff & users" },
+  ];
+
   return (
     <main className="flex-1 overflow-y-auto p-4 md:p-8 bg-transparent scrollbar-hide">
       <div className="max-w-6xl mx-auto space-y-6">
@@ -1685,19 +2853,58 @@ const TableSettings = () => {
             <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400 mb-1">Configuration</p>
             <h1 className="text-3xl font-display font-bold text-slate-900 mb-2">Settings</h1>
             <p className="text-slate-600 text-sm max-w-2xl">
-              Configure logo, video, and notes <strong className="text-slate-800">per branch</strong> (column{" "}
-              <strong className="text-slate-800">Branch</strong>). Each row is one location or franchise.
+              Manage branches, evaluation criteria, and staff user accounts.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => void addBranch()}
-            className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary-main px-5 py-2.5 text-sm font-bold text-white shadow-sm hover:bg-primary-main/90 transition-all"
-          >
-            <Plus className="w-4 h-4" />
-            Add branch
-          </button>
+          {settingsSection === "branches" ? (
+            <button
+              type="button"
+              onClick={() => void addBranch()}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary-main px-5 py-2.5 text-sm font-bold text-white shadow-sm hover:bg-primary-main/90 transition-all"
+            >
+              <Plus className="w-4 h-4" />
+              Add branch
+            </button>
+          ) : settingsSection === "criteria" ? (
+            <button
+              type="button"
+              onClick={() => void addCriterion()}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary-main px-5 py-2.5 text-sm font-bold text-white shadow-sm hover:bg-primary-main/90 transition-all"
+            >
+              <Plus className="w-4 h-4" />
+              Add criterion
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void addStaffMember()}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary-main px-5 py-2.5 text-sm font-bold text-white shadow-sm hover:bg-primary-main/90 transition-all"
+            >
+              <Plus className="w-4 h-4" />
+              Add staff / user
+            </button>
+          )}
         </div>
+
+        <nav className="flex flex-wrap gap-2 p-1 bg-slate-100 rounded-xl w-fit">
+          {settingsTabs.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => {
+                setSettingsSection(tab.id);
+                setRowMessage(null);
+              }}
+              className={`px-4 py-2 rounded-lg text-sm font-bold transition-all ${
+                settingsSection === tab.id
+                  ? "bg-white text-primary-main shadow-sm"
+                  : "text-slate-500 hover:text-slate-700"
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </nav>
 
         {loadError && (
           <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-800">
@@ -1705,6 +2912,7 @@ const TableSettings = () => {
           </div>
         )}
 
+        {settingsSection === "branches" ? (
         <section className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
@@ -1829,9 +3037,225 @@ const TableSettings = () => {
             </table>
           </div>
         </section>
+        ) : null}
+
+        {settingsSection === "criteria" ? (
+        <section className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="border-b border-slate-200 bg-slate-50/90">
+                  <th className="px-4 py-3 font-bold text-slate-700">Criterion</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 min-w-[240px]">Description</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 whitespace-nowrap">Active</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {criteria.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} className="px-4 py-10 text-center text-slate-500">
+                      No criteria yet. Click &quot;Add criterion&quot; to get started.
+                    </td>
+                  </tr>
+                ) : (
+                  criteria.map((row) => (
+                    <tr key={row.id} className="align-top hover:bg-slate-50/50">
+                      <td className="px-4 py-3">
+                        <input
+                          type="text"
+                          value={row.label}
+                          onChange={(e) => updateCriterionField(row.id, "label", e.target.value)}
+                          className="w-full min-w-[140px] rounded-lg border border-slate-200 px-3 py-2 font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                        />
+                      </td>
+                      <td className="px-4 py-3">
+                        <textarea
+                          value={row.description ?? ""}
+                          onChange={(e) => updateCriterionField(row.id, "description", e.target.value)}
+                          rows={2}
+                          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-slate-700 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                          placeholder="Criterion description…"
+                        />
+                      </td>
+                      <td className="px-4 py-3">
+                        <input
+                          type="checkbox"
+                          checked={row.is_active}
+                          onChange={(e) => updateCriterionField(row.id, "is_active", e.target.checked)}
+                          className="w-5 h-5 rounded border-slate-300"
+                        />
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <div className="flex flex-col items-end gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void saveCriterionRow(row)}
+                            className="rounded-lg bg-primary-main px-3 py-1.5 text-xs font-bold text-white hover:bg-primary-main/90"
+                          >
+                            Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void deleteCriterionRow(row)}
+                            className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-xs font-bold text-red-700 hover:bg-red-50"
+                          >
+                            Delete
+                          </button>
+                          {rowMessage?.id === row.id ? (
+                            <span
+                              className={`text-xs font-semibold max-w-[140px] ${rowMessage.ok ? "text-emerald-700" : "text-red-600"}`}
+                            >
+                              {rowMessage.text}
+                            </span>
+                          ) : null}
+                        </div>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+          <p className="px-4 py-3 text-xs text-slate-500 border-t border-slate-100">
+            Score on a 0–100% scale in the Evaluation tab.
+          </p>
+        </section>
+        ) : null}
+
+        {settingsSection === "staff" ? (
+        <section className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="border-b border-slate-200 bg-slate-50/90">
+                  <th className="px-4 py-3 font-bold text-slate-700 min-w-[140px]">Full name</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 min-w-[120px]">Branch</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 min-w-[100px]">Role</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 min-w-[120px]">Phone</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 min-w-[140px]">Password</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 whitespace-nowrap">Active</th>
+                  <th className="px-4 py-3 font-bold text-slate-700 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {staffMembers.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-10 text-center text-slate-500">
+                      No staff yet. Click &quot;Add staff / user&quot; to get started.
+                    </td>
+                  </tr>
+                ) : (
+                  staffMembers.map((row) => (
+                    <tr key={row.id} className="align-top hover:bg-slate-50/50">
+                      <td className="px-4 py-3">
+                        <input
+                          type="text"
+                          value={row.full_name}
+                          onChange={(e) => updateStaffField(row.id, "full_name", e.target.value)}
+                          className="w-full min-w-[120px] rounded-lg border border-slate-200 px-3 py-2 font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                        />
+                      </td>
+                      <td className="px-4 py-3">
+                        <select
+                          value={row.branch_name}
+                          onChange={(e) => updateStaffField(row.id, "branch_name", e.target.value)}
+                          className="w-full min-w-[120px] rounded-lg border border-slate-200 px-3 py-2 text-slate-800 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                        >
+                          {branches.length === 0 ? (
+                            <option value={row.branch_name}>{row.branch_name}</option>
+                          ) : (
+                            branches.map((b) => (
+                              <option key={b.id} value={b.branch_name}>
+                                {b.branch_name}
+                              </option>
+                            ))
+                          )}
+                        </select>
+                      </td>
+                      <td className="px-4 py-3">
+                        <input
+                          type="text"
+                          value={row.role ?? ""}
+                          onChange={(e) => updateStaffField(row.id, "role", e.target.value)}
+                          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-slate-700 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                          placeholder="Barista, server…"
+                        />
+                      </td>
+                      <td className="px-4 py-3">
+                        <input
+                          type="tel"
+                          value={row.phone ?? ""}
+                          onChange={(e) => updateStaffField(row.id, "phone", e.target.value)}
+                          className="w-full min-w-[110px] rounded-lg border border-slate-200 px-3 py-2 text-slate-700 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                          placeholder="+84…"
+                        />
+                      </td>
+                      <td className="px-4 py-3">
+                        <input
+                          type="password"
+                          value={passwordDrafts[row.id] ?? ""}
+                          onChange={(e) => {
+                            setPasswordDrafts((prev) => ({ ...prev, [row.id]: e.target.value }));
+                            setRowMessage(null);
+                          }}
+                          className="w-full min-w-[120px] rounded-lg border border-slate-200 px-3 py-2 text-slate-700 focus:outline-none focus:ring-2 focus:ring-primary-main/25"
+                          placeholder="New password"
+                          autoComplete="new-password"
+                        />
+                        <p className="text-[10px] text-slate-400 mt-1">Blank = keep current</p>
+                      </td>
+                      <td className="px-4 py-3">
+                        <input
+                          type="checkbox"
+                          checked={row.is_active}
+                          onChange={(e) => updateStaffField(row.id, "is_active", e.target.checked)}
+                          className="w-5 h-5 rounded border-slate-300"
+                        />
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <div className="flex flex-col items-end gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void saveStaffRow(row)}
+                            className="rounded-lg bg-primary-main px-3 py-1.5 text-xs font-bold text-white hover:bg-primary-main/90"
+                          >
+                            Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void deleteStaffRow(row)}
+                            className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-xs font-bold text-red-700 hover:bg-red-50"
+                          >
+                            Delete
+                          </button>
+                          {rowMessage?.id === row.id ? (
+                            <span
+                              className={`text-xs font-semibold max-w-[140px] ${rowMessage.ok ? "text-emerald-700" : "text-red-600"}`}
+                            >
+                              {rowMessage.text}
+                            </span>
+                          ) : null}
+                        </div>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+          <p className="px-4 py-3 text-xs text-slate-500 border-t border-slate-100">
+            Passwords are stored as bcrypt hashes. Active staff appear in Evaluation and the Staff list tab.
+          </p>
+        </section>
+        ) : null}
 
         <p className="text-xs text-slate-500">
-          Tip: use <strong className="text-slate-700">Save row</strong> after editing a branch. Video preview uses the same rules as the dashboard (e.g. Google Drive embed).
+          {settingsSection === "branches"
+            ? "Click Save after editing a branch."
+            : settingsSection === "criteria"
+              ? "Active criteria appear in the Evaluation tab."
+              : "Manage staff users (name, branch, role, phone, password) for evaluation."}
         </p>
       </div>
     </main>
@@ -2184,6 +3608,7 @@ export default function App() {
               { id: "checkwwork", label: "Checkwork", icon: <ClipboardList className="w-4 h-4" /> },
               { id: "dashboard", label: "Dashboard", icon: <LayoutDashboard className="w-4 h-4" /> },
               { id: "operations", label: "Operations", icon: <Settings2 className="w-4 h-4" /> },
+              { id: "evaluation", label: "Evaluation", icon: <Star className="w-4 h-4" /> },
               { id: "settings", label: "Settings", icon: <Settings2 className="w-4 h-4" /> },
             ].map((item) => (
               <button
@@ -2192,6 +3617,7 @@ export default function App() {
                   (item.id === "checkwwork" ||
                     item.id === "dashboard" ||
                     item.id === "operations" ||
+                    item.id === "evaluation" ||
                     item.id === "settings") &&
                   navigateToTab(item.id as AppTab)
                 }
@@ -2308,6 +3734,16 @@ export default function App() {
                 />
               ))}
             </motion.main>
+          ) : activeTab === "evaluation" ? (
+            <motion.div
+              key="evaluation"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="w-full h-full min-h-0 relative z-10 overflow-hidden"
+            >
+              <EvaluationPage />
+            </motion.div>
           ) : activeTab === "dashboard" ? (
             <motion.div
               key="dashboard"
@@ -2346,6 +3782,7 @@ export default function App() {
       <nav className="lg:hidden fixed bottom-6 left-1/2 -translate-x-1/2 w-[90%] bg-gray-900/90 backdrop-blur-lg border border-white/10 flex justify-around py-3 px-6 rounded-2xl shadow-2xl z-50">
         {[
           { id: "checkwwork", label: "Checkwork", icon: <ClipboardList /> },
+          { id: "evaluation", label: "Evaluation", icon: <Star /> },
           { id: "dashboard", label: "Dashboard", icon: <LayoutDashboard /> },
           { id: "operations", label: "Tasks", icon: <ClipboardList /> },
           { id: "settings", label: "Settings", icon: <Settings2 /> },
@@ -2356,6 +3793,7 @@ export default function App() {
               (item.id === "checkwwork" ||
                 item.id === "dashboard" ||
                 item.id === "operations" ||
+                item.id === "evaluation" ||
                 item.id === "settings") &&
               navigateToTab(item.id as AppTab)
             }
